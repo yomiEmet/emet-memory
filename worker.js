@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════
-// Emet Memory · Cloudflare Worker · v6.8.0
+// Emet Memory · Cloudflare Worker · v6.8.2
 // 2026.06.03 · v6.7.3 + 藤蔓星图(Galaxy:米色主题协调,SVG 力导向,关联记忆入口,局部/全图切换,双击节点跳记忆)
 // ═══════════════════════════════════════════════════
 
@@ -333,17 +333,18 @@ async function handleArchiveSweep(request, env) {
 
 // 导出向量+元数据，供可视化用。服务端直接做 PCA 降到 2D，前端拿到就能画。
 async function handleVizData(request, env) {
+  const url = new URL(request.url);
+  const force = url.searchParams.get("fresh") === "1";
   const all = await kvListByPrefix(env, "mem:");
-  const items = [];
-  const vectors = [];
-  for (const m of all) {
-    let vec = null;
-    try {
-      const raw = await env.MEMORY.get("vec:" + m.id);
-      if (raw) vec = JSON.parse(raw);
-    } catch(e) {}
-    if (!vec) continue;
-    items.push({
+
+  // 坐标签名：只取决于"有哪些记忆"。向量在记忆创建时生成、之后不变，
+  // 所以记忆集合不变时 PCA 坐标也不变 —— 可复用缓存，省去读全部向量(~1MB)+PCA。
+  const idsKey = all.length + "|" + all.map(m => m.id).sort().join(",");
+  let sigN = 5381; for (let i = 0; i < idsKey.length; i++) sigN = ((sigN * 33) ^ idsKey.charCodeAt(i)) >>> 0;
+  const sig = sigN.toString(36);
+
+  function buildItem(m, xy) {
+    return {
       id: m.id,
       content: (m.content || "").slice(0, 100),
       category: m.category || "semantic",
@@ -353,10 +354,39 @@ async function handleVizData(request, env) {
       tags: m.tags || [],
       linked: m.linked || [],
       link_rel: m.link_rel || {},
-      archived: !!m.archived
-    });
-    vectors.push(vec);
+      archived: !!m.archived,
+      x: xy ? xy[0] : 0,
+      y: xy ? xy[1] : 0
+    };
   }
+
+  // 缓存命中：直接用存好的坐标（记忆内容/连线仍读最新），跳过读向量与 PCA
+  if (!force) {
+    try {
+      const c = await env.MEMORY.get("viz:coords");
+      if (c) {
+        const cached = JSON.parse(c);
+        if (cached.sig === sig && cached.coords) {
+          const nodes = [];
+          for (const m of all) { const xy = cached.coords[m.id]; if (xy) nodes.push(buildItem(m, xy)); }
+          return jsonResponse({ count: nodes.length, nodes, cached: true });
+        }
+      }
+    } catch(e) {}
+  }
+
+  // 缓存未命中：并行读向量 → PCA → 存坐标
+  const withVec = [];
+  const vectors = [];
+  const vecRaws = await Promise.all(all.map(m => env.MEMORY.get("vec:" + m.id).catch(() => null)));
+  all.forEach((m, idx) => {
+    const raw = vecRaws[idx];
+    if (!raw) return;
+    let vec = null; try { vec = JSON.parse(raw); } catch(e) {}
+    if (!vec) return;
+    withVec.push(m);
+    vectors.push(vec);
+  });
 
   // PCA 降到 2D（够快，前端不用扛 t-SNE）
   let coords = [];
@@ -403,13 +433,14 @@ async function handleVizData(request, env) {
     coords = coords.map(c=>[ (c[0]-xmin)/xr*2-1, (c[1]-ymin)/yr*2-1 ]);
   }
 
-  items.forEach((it,i)=>{ it.x = coords[i]?coords[i][0]:0; it.y = coords[i]?coords[i][1]:0; });
+  const coordMap = {};
+  withVec.forEach((m, i) => { coordMap[m.id] = coords[i] ? coords[i] : [0, 0]; });
+  const nodes = withVec.map((m) => buildItem(m, coordMap[m.id]));
 
-  return jsonResponse({
-    count: items.length,
-    nodes: items,
-    note: "x,y 是 bge-m3 真向量 PCA 降维到 2D 的坐标，意思相近的点天然靠拢。linked/link_rel 是织藤的线。"
-  });
+  // 存坐标缓存（只在重算时写一次；下次记忆集合不变即直接命中）
+  try { await env.MEMORY.put("viz:coords", JSON.stringify({ sig, coords: coordMap })); } catch(e) {}
+
+  return jsonResponse({ count: nodes.length, nodes, cached: false });
 }
 
 async function handleRetag(request, env) {
@@ -439,6 +470,99 @@ async function handleRetag(request, env) {
     changed_now: changedCount,
     preview: changes.slice(0, 40)
   });
+}
+
+// ─── 一次性回填:给所有老记忆跑自动织藤 ───
+// 高效做法:全部记忆+向量只读一次，内存里算两两相似度（复刻 weaveCandidates 打分），再批量连。
+// 默认 dry-run（只预览要连多少条）；加 ?apply=1 才真正写入。可用 ?threshold= / ?top= 调参。
+async function handleWeaveBackfill(request, env) {
+  const url = new URL(request.url);
+  const apply = url.searchParams.get("apply") === "1";
+  const threshold = parseFloat(url.searchParams.get("threshold") || "0.42");
+  const topN = parseInt(url.searchParams.get("top") || "3", 10);
+
+  const all = await kvListByPrefix(env, "mem:");
+  const pool = all.filter(m => !m.archived);
+  const vecRaws = await Promise.all(pool.map(m => env.MEMORY.get("vec:" + m.id).catch(() => null)));
+  const vecs = {};
+  pool.forEach((m, i) => { if (vecRaws[i]) { try { vecs[m.id] = JSON.parse(vecRaws[i]); } catch(e) {} } });
+  const withVec = pool.filter(m => vecs[m.id]);
+  const n = withVec.length;
+
+  // tag IDF（与 weaveCandidates 一致）
+  const tagFreq = {};
+  for (const m of all) (m.tags || []).forEach(t => { const lt = t.toLowerCase(); tagFreq[lt] = (tagFreq[lt] || 0) + 1; });
+  const totalN = all.length || 1;
+  const maxIdf = Math.log(totalN + 1);
+  const idf = t => Math.log((totalN + 1) / ((tagFreq[t] || 0) + 1));
+
+  // 预归一化向量 → 余弦相似度退化为点积；对称矩阵只算上三角
+  const norm = {};
+  withVec.forEach(m => { const v = vecs[m.id]; let s = 0; for (let i=0;i<v.length;i++) s += v[i]*v[i]; norm[m.id] = Math.sqrt(s) || 1; });
+  const sim = []; for (let i=0;i<n;i++) sim.push(new Float32Array(n));
+  for (let i=0;i<n;i++) {
+    const vi = vecs[withVec[i].id], ni = norm[withVec[i].id];
+    for (let j=i+1;j<n;j++) {
+      const vj = vecs[withVec[j].id]; let dot = 0; for (let k=0;k<vi.length;k++) dot += vi[k]*vj[k];
+      const c = dot / (ni * norm[withVec[j].id]); sim[i][j] = c; sim[j][i] = c;
+    }
+  }
+
+  // 每条记忆取候选（复刻 weaveCandidates 的打分与硬过滤）
+  const newPairs = {};
+  for (let i=0;i<n;i++) {
+    const A = withVec[i]; const aTags = (A.tags || []).map(t => t.toLowerCase());
+    const scored = [];
+    for (let j=0;j<n;j++) {
+      if (j === i) continue;
+      const B = withVec[j]; const v = sim[i][j];
+      const bTags = (B.tags || []).map(t => t.toLowerCase());
+      const shared = aTags.filter(t => bTags.includes(t));
+      let tScore = 0;
+      if (shared.length) { const idfSum = shared.reduce((s,t)=>s+idf(t),0); tScore = Math.min(1, idfSum/(2*maxIdf)); }
+      let w;
+      if (shared.length === 0 && v < 0.7) w = v*0.3; else w = v*0.55 + tScore*0.45;
+      scored.push({ id: B.id, w });
+    }
+    scored.sort((x,y) => y.w - x.w);
+    scored.filter(c => c.w >= threshold).slice(0, topN).forEach(c => {
+      const key = [A.id, c.id].sort().join('|');
+      if (!newPairs[key]) newPairs[key] = { a: A.id, b: c.id };
+    });
+  }
+
+  const byId = {}; all.forEach(m => byId[m.id] = m);
+  const toAdd = [];
+  for (const k in newPairs) {
+    const { a, b } = newPairs[k];
+    if ((byId[a].linked || []).includes(b)) continue; // 已经连着了，跳过
+    toAdd.push(newPairs[k]);
+  }
+
+  if (!apply) {
+    return jsonResponse({
+      mode: "预览(dry-run)——加 ?apply=1 才真正写入", threshold, topN,
+      memories_with_vec: n, new_links: toAdd.length,
+      sample: toAdd.slice(0, 20).map(p => ({
+        a: (byId[p.a].content || "").slice(0, 22),
+        b: (byId[p.b].content || "").slice(0, 22)
+      }))
+    });
+  }
+
+  const dirty = new Set();
+  for (const { a, b } of toAdd) {
+    const A = byId[a], B = byId[b];
+    A.linked = A.linked || []; B.linked = B.linked || [];
+    A.link_rel = A.link_rel || {}; B.link_rel = B.link_rel || {};
+    if (!A.linked.includes(b)) A.linked.push(b);
+    if (!B.linked.includes(a)) B.linked.push(a);
+    A.link_rel[b] = "自动关联"; B.link_rel[a] = "自动关联";
+    dirty.add(a); dirty.add(b);
+  }
+  for (const id of dirty) { byId[id].updated_at = now(); await kvPut(env, `mem:${id}`, byId[id]); }
+
+  return jsonResponse({ mode: "已执行 ✓", threshold, topN, new_links: toAdd.length, memories_updated: dirty.size });
 }
 
 // ─── MCP 工具定义 ───
@@ -645,14 +769,27 @@ activations: 0,
 created_at: now(), updated_at: now()
 };
 await kvPut(env, `mem:${id}`, memory);
-// v6.7.3 自动捞候选:存完后跑 weave,top 3 分数 ≥ 0.6 写入 weave_suggested,等待 Emet 判断织藤
+// 真·全自动织藤:存完后跑 weave,分数 ≥ 0.6 的前 3 条旧记忆直接双向关联（和手动连一致，标记"自动关联"）
 try {
   const cands = await weaveCandidates(env, memory.content, { tags: memory.tags, exclude_id: id, limit: 5 });
-  const top = cands.filter(c => c.score >= 0.6).slice(0, 3);
-  if (top.length) {
-    memory.weave_suggested = top.map(c => ({ id: c.id, score: c.score, preview: c.content, at: now() }));
-    await kvPut(env, `mem:${id}`, memory);
+  const top = cands.filter(c => c.score >= 0.42).slice(0, 3);
+  memory.linked = memory.linked || [];
+  memory.link_rel = memory.link_rel || {};
+  let linkedAny = false;
+  for (const c of top) {
+    const other = await kvGet(env, `mem:${c.id}`);
+    if (!other) continue;
+    other.linked = other.linked || [];
+    if (!memory.linked.includes(c.id)) memory.linked.push(c.id);
+    if (!other.linked.includes(id)) other.linked.push(id);
+    other.link_rel = other.link_rel || {};
+    memory.link_rel[c.id] = "自动关联";
+    other.link_rel[id] = "自动关联";
+    other.updated_at = now();
+    await kvPut(env, `mem:${c.id}`, other);
+    linkedAny = true;
   }
+  if (linkedAny) await kvPut(env, `mem:${id}`, memory);
 } catch (e) { console.error("auto-weave failed:", e?.message || e); }
 vectorUpsert(env, id, args.content);
 return { success: true, id, message: `记忆已保存：${args.content.substring(0, 50)}...` };
@@ -1056,7 +1193,7 @@ if (method === "initialize") {
 return jsonResponse({ jsonrpc: "2.0", id, result: {
 protocolVersion: "2024-11-05",
 capabilities: { tools: { listChanged: false } },
-serverInfo: { name: "emet-memory", version: "6.6.0" }
+serverInfo: { name: "emet-memory", version: "6.8.2" }
 } });
 }
 if (method === "notifications/initialized") return jsonResponse({ jsonrpc: "2.0", id, result: {} });
@@ -1124,7 +1261,7 @@ const bytes = new Uint8Array(binary.length);
 for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 return new Response(bytes, { headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" } });
 }
-if (path === "/health") return jsonResponse({ status: "ok", version: "6.6.0", timestamp: now() });
+if (path === "/health") return jsonResponse({ status: "ok", version: "6.8.2", timestamp: now() });
 
 if (path === "/api/data" && method === "GET") {
 const memories = await kvListByPrefix(env, "mem:");
@@ -1345,7 +1482,7 @@ const bytes = new Uint8Array(binary.length);
 for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 return new Response(bytes, { headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" } });
 }
-if (path === "/health") return jsonResponse({ status: "ok", version: "6.6.0", timestamp: now() });
+if (path === "/health") return jsonResponse({ status: "ok", version: "6.8.2", timestamp: now() });
 
 if (path === "/api/data" && method === "GET") {
 const memories = await kvListByPrefix(env, "mem:");
@@ -1550,7 +1687,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<title>Emet Memory · v6.5 Preview</title>
+<title>Emet Memory · v6.8.2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=Noto+Serif+SC:wght@300;400;500;600&family=Noto+Sans+SC:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600&display=swap" onload="this.onload=null;this.rel='stylesheet'">
@@ -2607,8 +2744,9 @@ border: 1px solid var(--line);
 .galaxy-btn.hide { display:none; }
 .galaxy-container { flex:1; position:relative; overflow:hidden; }
 .galaxy-svg { width:100%; height:100%; display:block; touch-action:manipulation; }
-.gx-core { cursor:pointer; transition:fill .45s ease, fill-opacity .45s ease, r .4s ease, stroke .3s ease, stroke-width .3s ease; }
-.gx-halo { pointer-events:none; transition:fill .45s ease, fill-opacity .45s ease, r .4s ease; }
+.gx-core { cursor:pointer; transition:fill .45s ease, fill-opacity .45s ease, r .4s ease, stroke .3s ease, stroke-width .3s ease; animation:gxFloat 7s ease-in-out infinite; }
+.gx-halo { pointer-events:none; transition:fill .45s ease, fill-opacity .45s ease, r .4s ease; animation:gxFloat 7s ease-in-out infinite; }
+@keyframes gxFloat { 0%{transform:translate(0,0);} 25%{transform:translate(1.2px,-1.6px);} 50%{transform:translate(-1.1px,1.1px);} 75%{transform:translate(1.4px,0.9px);} 100%{transform:translate(0,0);} }
 .gx-pulse { stroke:var(--accent); stroke-width:2.5; animation:gxPulse 1s ease-in-out infinite; }
 @keyframes gxPulse { 0%,100%{stroke-opacity:.9;} 50%{stroke-opacity:.25;} }
 .gx-edge { transition:stroke .35s ease, stroke-opacity .35s ease, stroke-width .35s ease; pointer-events:none; }
@@ -2634,7 +2772,10 @@ border: 1px solid var(--line);
 .gx-cbtn { border:none; border-radius:12px; padding:7px 16px; font-size:13px; cursor:pointer; font-family:var(--sans-zh); }
 .gx-cancel { background:var(--bg-soft); color:var(--ink-soft); }
 .gx-cdel { background:#C0392B; color:#fff; }
-.gx-hint { position:absolute; bottom:20px; left:50%; transform:translateX(-50%); font-family:var(--serif-en); font-size:13px; color:var(--ink-faint); letter-spacing:1px; background:var(--bg); padding:6px 16px; border-radius:14px; opacity:.85; transition:opacity .4s; pointer-events:none; text-align:center; }
+.gx-hint { display:none !important; }
+.gx-legend { position:absolute; bottom:16px; left:16px; display:flex; flex-direction:column; gap:5px; padding:9px 12px; background:var(--bg); border:1px solid var(--line); border-radius:10px; opacity:.92; pointer-events:none; box-shadow:0 2px 12px rgba(42,39,36,0.06); }
+.gx-leg-item { display:flex; align-items:center; gap:7px; font-family:var(--serif-zh); font-size:11px; color:var(--ink-soft); letter-spacing:.5px; line-height:1; }
+.gx-leg-item i { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
 </style>
 
 </head>
@@ -2868,7 +3009,8 @@ border: 1px solid var(--line);
     <div class="galaxy-tooltip" id="galaxyTooltip"></div>
     <div class="gx-banner" id="galaxyBanner"></div>
     <div class="gx-confirm" id="galaxyConfirm"><span class="gx-confirm-txt" id="galaxyConfirmTxt">拆掉这条藤?</span><button class="gx-cbtn gx-cancel" id="galaxyCancel">算了</button><button class="gx-cbtn gx-cdel" id="galaxyDel">拆掉</button></div>
-    <div class="gx-hint" id="galaxyHint">长按一颗星 → 连藤 · 点连线 → 拆藤 · 点空白恢复</div>
+    <div class="gx-hint" id="galaxyHint"></div>
+    <div class="gx-legend" id="galaxyLegend"></div>
   </div>
 </div>
 
@@ -4794,6 +4936,8 @@ var GX_CATS = ['core','scene','emotion','semantic','image','procedure'];
 var GX_CAT_ZH = { core:'核心', scene:'情景', emotion:'情绪', semantic:'语义', image:'形象', procedure:'程序' };
 
 function gxKey(a,b){ return [a,b].sort().join('|'); }
+function gxFloatStyle(i){ var dur=6+(i%7)*0.5; var dly=-((i*1.37)%dur); return 'animation-delay:'+dly.toFixed(2)+'s;animation-duration:'+dur.toFixed(2)+'s;'; }
+function gxBuildLegend(){ var el=document.getElementById('galaxyLegend'); if(!el)return; el.innerHTML=GX_CATS.map(function(c){ return '<div class="gx-leg-item"><i style="background:'+GX_COLORS[c]+'"></i>'+GX_CAT_ZH[c]+'</div>'; }).join(''); }
 function gxBaseR(n){ return GX.haslink[n.id] ? (4+n.importance*0.6) : (3.5+n.importance*0.35); }
 function gxEsc(s){ return (s||'').replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 function gxRelX(n){ return GX.W/2 + n.ox * GX.W*0.42; }
@@ -4850,8 +4994,8 @@ function gxAppendEdge(e){
 }
 function gxBuild(){
   var h='<g id="gxEdgeLayer"></g>';
-  GX.nodes.forEach(function(n){ var c=GX_COLORS[n.category]; var lk=GX.haslink[n.id]; h+='<circle class="gx-halo" id="gxh_'+n.id+'" fill="'+c+'" fill-opacity="'+(lk?0.15:0)+'" r="'+(lk?(8+n.importance):0)+'"/>'; });
-  GX.nodes.forEach(function(n){ var c=GX_COLORS[n.category]; var lk=GX.haslink[n.id]; h+='<circle class="gx-core" id="gxn_'+n.id+'" data-id="'+n.id+'" fill="'+c+'" fill-opacity="'+(lk?1:0.55)+'" r="'+gxBaseR(n)+'"/>'; });
+  GX.nodes.forEach(function(n,i){ var c=GX_COLORS[n.category]; var lk=GX.haslink[n.id]; h+='<circle class="gx-halo" id="gxh_'+n.id+'" style="'+gxFloatStyle(i)+'" fill="'+c+'" fill-opacity="'+(lk?0.15:0)+'" r="'+(lk?(8+n.importance):0)+'"/>'; });
+  GX.nodes.forEach(function(n,i){ var c=GX_COLORS[n.category]; var lk=GX.haslink[n.id]; h+='<circle class="gx-core" id="gxn_'+n.id+'" data-id="'+n.id+'" style="'+gxFloatStyle(i)+'" fill="'+c+'" fill-opacity="'+(lk?1:0.55)+'" r="'+gxBaseR(n)+'"/>'; });
   GX_CATS.forEach(function(c){ h+='<g class="gx-cat" id="gxc_'+c+'" opacity="0"><text class="gx-cat-zh" text-anchor="middle" font-size="15" fill="'+GX_COLORS[c]+'" font-weight="600"></text><text class="gx-cat-num" text-anchor="middle" font-size="11" fill="#A8A39B"></text></g>'; });
   GX.nodes.forEach(function(n){ h+='<g class="gx-label" id="gxl_'+n.id+'" opacity="0"><rect class="gx-label-bg" rx="4"/><text class="gx-label-text" text-anchor="middle"></text></g>'; });
   GX.el.svg.innerHTML=h;
@@ -5019,6 +5163,7 @@ async function openGalaxy(centerId){
   document.getElementById('galaxySegCat').className='';
   GX.focusId=null; GX.linkSource=null; GX.pendingDelKey=null;
   gxBuild();
+  gxBuildLegend();
   gxSetEdges(true);
   gxSetTargets(); gxSnap(); gxPaint();
   GX.el.search.value=''; GX.el.hint.textContent='长按一颗星 → 连藤 · 点连线 → 拆藤 · 点空白恢复'; GX.el.hint.style.opacity='0.85';
@@ -5076,6 +5221,7 @@ if (path === "/api/migrate-vectors") return handleMigrateVectors(request, env);
 if (path === "/api/wake") return handleWake(request, env);
 if (path === "/api/archive-sweep") return handleArchiveSweep(request, env);
 if (path === "/api/retag") return handleRetag(request, env);
+if (path === "/api/weave-backfill") return handleWeaveBackfill(request, env);
 if (path === "/api/viz-data") return handleVizData(request, env);
 if (path.startsWith("/api/") || path === "/health" || path.startsWith("/play/") || path === "/icon.png") return handleAPIv2(request, env);
 if (path === "/" || path === "") {
