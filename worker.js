@@ -750,6 +750,37 @@ return { error: "条目已锁定（locked=true），需要静怡在前端 UI 解
 return null;
 }
 
+// ─── 会话合并（消息级并集 + 会话级 last-write-wins）───
+function mergeMessages(a = [], b = []) {
+  const hasMid = (arr) => arr.length > 0 && arr.every((m) => m && m.mid);
+  if (hasMid(a) && hasMid(b)) {
+    const map = new Map();
+    for (const m of [...a, ...b]) {
+      const ex = map.get(m.mid);
+      // 同 mid 取 content 更长的一份（流式可能某端只存了半截）
+      if (!ex || (m.content || "").length > (ex.content || "").length) map.set(m.mid, m);
+    }
+    return [...map.values()].sort((x, y) => {
+      const xt = x.ts || "", yt = y.ts || "";
+      return xt < yt ? -1 : xt > yt ? 1 : 0;
+    });
+  }
+  // 无 mid 退化：取更长的一方（append-only 下通常一方是另一方前缀）
+  return a.length >= b.length ? a : b;
+}
+
+function mergeSession(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const newer = (a.updated_at || "") >= (b.updated_at || "") ? a : b;
+  const older = newer === a ? b : a;
+  return {
+    ...newer,                                          // 会话级字段（标题/删除标记）取较新
+    created_at: older.created_at || newer.created_at,  // 创建时间取较早
+    messages: mergeMessages(a.messages || [], b.messages || []),
+  };
+}
+
 // ─── 工具执行 ───
 async function executeTool(name, args, env) {
 switch (name) {
@@ -1650,6 +1681,42 @@ if (path === "/api/unlink" && method === "POST") {
 const body = await request.json();
 const result = await executeTool("memory_unlink", body, env);
 return jsonResponse(result);
+}
+
+// ─── 会话云同步（chat: 前缀，与记忆数据隔离）───
+if (path === "/api/chat" && method === "GET") {
+  const since = url.searchParams.get("since");
+  let sessions = await kvListByPrefix(env, "chat:");
+  if (since) sessions = sessions.filter((s) => (s.updated_at || "") > since);
+  return jsonResponse({ sessions, server_time: now() });
+}
+// 批量对账（必须在 :id 正则之前，否则 "sync" 会被当成会话 id）
+if (path === "/api/chat/sync" && method === "POST") {
+  const body = await request.json();
+  const incoming = Array.isArray(body.sessions) ? body.sessions : [];
+  for (const s of incoming) {
+    if (!s || !s.id) continue;
+    const existing = await kvGet(env, "chat:" + s.id);
+    await kvPut(env, "chat:" + s.id, mergeSession(existing, s));
+  }
+  const all = await kvListByPrefix(env, "chat:");
+  return jsonResponse({ sessions: all, server_time: now() });
+}
+const chatMatch = path.match(/^\/api\/chat\/(.+)$/);
+if (chatMatch && method === "PUT") {
+  const id = chatMatch[1];
+  const body = await request.json();
+  const existing = await kvGet(env, "chat:" + id);
+  const merged = mergeSession(existing, { ...body, id });
+  await kvPut(env, "chat:" + id, merged);
+  return jsonResponse({ success: true, item: merged });
+}
+if (chatMatch && method === "DELETE") {
+  const id = chatMatch[1];
+  const existing = await kvGet(env, "chat:" + id);
+  const tomb = { ...(existing || { id }), id, deleted: true, updated_at: now() };
+  await kvPut(env, "chat:" + id, tomb);
+  return jsonResponse({ success: true });
 }
 
 // 信件（KV 还是 handoff:，但有 kind 字段区分 handoff / daily）
