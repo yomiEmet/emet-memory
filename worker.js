@@ -3,7 +3,7 @@
 // 2026.06.03 · v6.7.3 + 藤蔓星图(Galaxy:米色主题协调,SVG 力导向,关联记忆入口,局部/全图切换,双击节点跳记忆)
 // ═══════════════════════════════════════════════════
 
-const ADMIN_KEY = "0374";
+// ADMIN_KEY 已迁移至 Cloudflare Secret（wrangler secret put ADMIN_KEY），代码内经 env.ADMIN_KEY 读取
 const APP_ICON_BASE64 = "";
 const ANNIVERSARY = "2025-04-06";
 
@@ -1239,8 +1239,10 @@ headers: {
 });
 }
 
-function checkAuth(request) {
-return request.headers.get("X-Admin-Key") === ADMIN_KEY;
+function checkAuth(request, env) {
+// secret 未配置时一律拒绝（fail-closed），防止误部署成无鉴权
+if (!env || !env.ADMIN_KEY) return false;
+return request.headers.get("X-Admin-Key") === env.ADMIN_KEY;
 }
 
 // ─── REST API ───
@@ -1251,7 +1253,7 @@ const method = request.method;
 
 if (path === "/api/auth" && method === "POST") {
 const body = await request.json();
-if (body.key === ADMIN_KEY) return jsonResponse({ success: true });
+if (env.ADMIN_KEY && body.key === env.ADMIN_KEY) return jsonResponse({ success: true });
 return jsonResponse({ error: "wrong" }, 401);
 }
 if (path === "/icon.png" && APP_ICON_BASE64) {
@@ -1280,13 +1282,16 @@ if (path === "/api/stats" && method === "GET") return jsonResponse(await execute
 // 游戏播放：纯HTML输出（公开，不鉴权）
 const playMatch = path.match(/^\/play\/([^\/]+)$/);
 if (playMatch && method === "GET") {
+if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) {
+return new Response("Unauthorized", { status: 401 });
+}
 const g = await kvGet(env, `game:${playMatch[1]}`);
 if (!g || !g.html) return new Response("Game not found", { status: 404 });
 return new Response(g.html, { headers: { "Content-Type": "text/html;charset=UTF-8" } });
 }
 
 // 写操作鉴权
-if (method !== "GET" && !checkAuth(request)) return jsonResponse({ error: "Unauthorized" }, 401);
+if (method !== "GET" && !checkAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
 
 // 通用 PUT 助手：直接读写 KV，允许修改 locked（前端用，跟 MCP 区分开）
 async function restPut(prefix, id, body, allowedFields) {
@@ -1472,7 +1477,7 @@ const method = request.method;
 
 if (path === "/api/auth" && method === "POST") {
 const body = await request.json();
-if (body.key === ADMIN_KEY) return jsonResponse({ success: true });
+if (env.ADMIN_KEY && body.key === env.ADMIN_KEY) return jsonResponse({ success: true });
 return jsonResponse({ error: "wrong" }, 401);
 }
 if (path === "/icon.png" && APP_ICON_BASE64) {
@@ -1500,12 +1505,15 @@ if (path === "/api/stats" && method === "GET") return jsonResponse(await execute
 
 const playMatch = path.match(/^\/play\/([^\/]+)$/);
 if (playMatch && method === "GET") {
+if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) {
+return new Response("Unauthorized", { status: 401 });
+}
 const g = await kvGet(env, `game:${playMatch[1]}`);
 if (!g || !g.html) return new Response("Game not found", { status: 404 });
 return new Response(g.html, { headers: { "Content-Type": "text/html;charset=UTF-8" } });
 }
 
-if (method !== "GET" && !checkAuth(request)) return jsonResponse({ error: "Unauthorized" }, 401);
+if (method !== "GET" && !checkAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
 
 async function restPut(prefix, id, body, allowedFields) {
 const existing = await kvGet(env, prefix + id);
@@ -3147,7 +3155,7 @@ let ADMIN_KEY = sessionStorage.getItem('emet_admin_key') || localStorage.getItem
 async function callAPI(path, opts) {
   opts = opts || {};
   opts.headers = opts.headers || {};
-  if ((opts.method || 'GET') !== 'GET' && ADMIN_KEY) {
+  if (ADMIN_KEY) {
     opts.headers['X-Admin-Key'] = ADMIN_KEY;
   }
   const res = await fetch(path, opts);
@@ -5257,22 +5265,88 @@ document.getElementById('galaxyCloseBtn').addEventListener('click', gxClose);
 `;
 
 // ─── 主入口 ───
+const ALLOWED_ORIGINS = [
+"https://emet-frontend.pages.dev",
+"http://localhost:5173"
+];
+
+// ── /mcp、/sse 的 CORS ──
+// 对所有来源放行 *（浏览器非凭证请求 + claude.ai 连接器都需要）；
+// 关键：预检必须回显 Allow-Headers 含 X-Admin-Key，否则前端带头的
+// application/json 请求会被预检拦死。
+const MCP_CORS = {
+"Access-Control-Allow-Origin": "*",
+"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+"Access-Control-Allow-Headers": "Content-Type, X-Admin-Key",
+"Access-Control-Max-Age": "86400"
+};
+
+// /mcp、/sse 鉴权：与 /api/* 同一把 ADMIN_KEY。
+// ① X-Admin-Key 请求头（前端用）；② ?key= 查询参数（claude.ai 连接器在端点 URL 上带）。
+function checkMcpAuth(request, env) {
+if (!env || !env.ADMIN_KEY) return false; // 未配置 secret 时一律拒绝（fail-closed）
+if (request.headers.get("X-Admin-Key") === env.ADMIN_KEY) return true;
+const qk = new URL(request.url).searchParams.get("key"); // 删掉这两行 = 纯请求头校验
+return qk === env.ADMIN_KEY;
+}
+
+// /mcp、/sse 鉴权失败：JSON-RPC 错误体 + CORS 头（让浏览器读得到 401，而非吃 CORS 报错）
+function mcpUnauthorized() {
+return new Response(
+JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "Unauthorized" } }),
+{ status: 401, headers: { "Content-Type": "application/json", ...MCP_CORS } }
+);
+}
+
+// 出口统一处理 CORS：剥掉处理器自带的 * 头；Origin 命中白名单才回显并补齐
+function withCors(response, request) {
+const origin = request.headers.get("Origin");
+const h = new Headers(response.headers);
+["Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers", "Access-Control-Max-Age"].forEach(k => h.delete(k));
+if (origin && ALLOWED_ORIGINS.includes(origin)) {
+h.set("Access-Control-Allow-Origin", origin);
+h.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+h.set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key");
+h.set("Access-Control-Max-Age", "86400");
+h.append("Vary", "Origin");
+}
+return new Response(response.body, { status: response.status, statusText: response.statusText, headers: h });
+}
+
 export default {
 async fetch(request, env, ctx) {
+const res = await routeRequest(request, env, ctx);
+// 红线：/mcp 与 /sse 的响应原样返回，不经 withCors，响应头逐字节不变
+const p = new URL(request.url).pathname;
+if (p === "/mcp" || p === "/sse") return res;
+return withCors(res, request);
+}
+};
+
+async function routeRequest(request, env, ctx) {
 const url = new URL(request.url);
 const path = url.pathname;
 if (request.method === "OPTIONS") {
-return new Response(null, {
-headers: {
-"Access-Control-Allow-Origin": "*",
-"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-"Access-Control-Allow-Headers": "*",
-"Access-Control-Max-Age": "86400"
+// /mcp、/sse 的预检要带自己的 CORS（含 X-Admin-Key），否则前端带头请求过不了预检；
+// 其余路径仍回裸 204，CORS 由出口 withCors 按白名单决定下发与否
+if (path === "/mcp" || path === "/sse") {
+return new Response(null, { status: 204, headers: MCP_CORS });
 }
-});
+return new Response(null, { status: 204 });
+}
+// ── /mcp、/sse 鉴权闸门：与 /api/* 一致，要求 X-Admin-Key（或 ?key=）──
+// 必须放在 handleMCP / handleSSE 之前。POST /sse 也会进 handleMCP，故一并拦。
+if (path === "/mcp" || path === "/sse") {
+if (!checkMcpAuth(request, env)) return mcpUnauthorized();
 }
 if (path === "/mcp" && request.method === "POST") return handleMCP(request, env);
 if (path === "/sse") return handleSSE(request, env);
+// ── 统一鉴权闸门：/api/* 全部要求 X-Admin-Key ──
+// 仅豁免 /api/auth（验密接口本身）；/health、/play/、/icon.png 路径不匹配，不受影响
+// 注意必须放在下面六个旁路维护路由之前，否则它们绕过鉴权
+if (path.startsWith("/api/") && path !== "/api/auth" && !checkAuth(request, env)) {
+return jsonResponse({ error: "Unauthorized" }, 401);
+}
 if (path === "/api/migrate-vectors") return handleMigrateVectors(request, env);
 if (path === "/api/wake") return handleWake(request, env);
 if (path === "/api/archive-sweep") return handleArchiveSweep(request, env);
@@ -5285,4 +5359,3 @@ return new Response(renderFrontend(), { headers: { "Content-Type": "text/html;ch
 }
 return jsonResponse({ error: "Not found" }, 404);
 }
-};
