@@ -1719,6 +1719,22 @@ if (chatMatch && method === "DELETE") {
   return jsonResponse({ success: true });
 }
 
+// ─── 设置云同步（settings:global 一个键，与其他数据隔离）───
+if (path === "/api/settings" && method === "GET") {
+  const s = await kvGet(env, "settings:global");
+  return jsonResponse({ settings: s || null, server_time: now() });
+}
+if (path === "/api/settings" && method === "PUT") {
+  const body = await request.json();
+  const existing = await kvGet(env, "settings:global");
+  // 整块 last-write-wins：updated_at 不旧于服务端才覆盖（防旧设备覆盖新设置）
+  if (!existing || (body.updated_at || "") >= (existing.updated_at || "")) {
+    await kvPut(env, "settings:global", body);
+    return jsonResponse({ success: true, item: body });
+  }
+  return jsonResponse({ success: true, item: existing }); // 服务端更新，回服务端版本
+}
+
 // 信件（KV 还是 handoff:，但有 kind 字段区分 handoff / daily）
 const hoMatch = path.match(/^\/api\/handoff\/(.+)$/);
 if (hoMatch) {
