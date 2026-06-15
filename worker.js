@@ -1735,6 +1735,28 @@ if (path === "/api/settings" && method === "PUT") {
   return jsonResponse({ success: true, item: existing }); // 服务端更新，回服务端版本
 }
 
+// ─── Archive 对话档案云端持久化（archive:data 单 blob 打包存取）───
+// 哑存储：整包存、整包取。增量合并与版本时间由前端外层同步层负责。
+if (path === "/api/archive" && method === "GET") {
+  const archive = await kvGet(env, "archive:data");
+  return jsonResponse({ archive: archive || null, server_time: now() });
+}
+if (path === "/api/archive" && method === "PUT") {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "invalid json" }, 400);
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return jsonResponse({ error: "archive must be an object" }, 400);
+  }
+  // updated_at 兜底：前端通常带版本时间，没带就用服务端时间
+  const blob = { ...body, updated_at: body.updated_at || now() };
+  await kvPut(env, "archive:data", blob);
+  return jsonResponse({ success: true, updated_at: blob.updated_at });
+}
+
 // 信件（KV 还是 handoff:，但有 kind 字段区分 handoff / daily）
 const hoMatch = path.match(/^\/api\/handoff\/(.+)$/);
 if (hoMatch) {
