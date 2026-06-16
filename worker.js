@@ -5474,6 +5474,71 @@ cursor = l.list_complete ? null : l.cursor;
 return lastKey ? await kvGet(env, lastKey) : null;
 }
 
+// ── Sleep Analysis 样本归一化与拼装（见 docs/sleep-patch.md）──
+// 不同 iOS / locale / 数据源给出的 Value 标签字符串不一致，全部映射到 4 个规范类别。
+const SLEEP_LABELS = {
+"Core": "Core", "Asleep Core": "Core", "AsleepCore": "Core", "Asleep (Core)": "Core",
+"Deep": "Deep", "Asleep Deep": "Deep", "AsleepDeep": "Deep", "Asleep (Deep)": "Deep",
+"REM":  "REM",  "Asleep REM":  "REM",  "AsleepREM":  "REM",  "Asleep (REM)":  "REM",
+"Awake": "Awake", "In Bed": "Awake", "InBed": "Awake",
+};
+
+// 把 iOS Shortcuts 上报的 sleep sample 数组拼成 7 个睡眠字段。
+// 算法：去重 → 解析 ISO 8601 + 归一化 Value → "昨天12:00→今天12:00" (+08:00) 窗口筛选 → 累加阶段。
+// 返回 null 表示无可用数据，调用方应跳过覆盖。
+function parseSleepSamples(samples, dateStr) {
+if (!Array.isArray(samples) || samples.length === 0) return null;
+if (typeof dateStr !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
+
+const seen = new Set();
+const unique = [];
+for (const s of samples) {
+if (!s || typeof s.Start !== "string") continue;
+const key = s.Start + "|" + s.Value + "|" + s.Duration;
+if (!seen.has(key)) { seen.add(key); unique.push(s); }
+}
+
+const parsed = [];
+for (const s of unique) {
+const dt = new Date(s.Start);
+if (isNaN(dt.getTime())) continue;
+const dur = Number(s.Duration);
+if (!Number.isFinite(dur) || dur <= 0 || dur > 14 * 60) continue;
+const val = SLEEP_LABELS[s.Value];
+if (!val) continue;
+parsed.push({ dt, dur, val });
+}
+parsed.sort((a, b) => a.dt - b.dt);
+if (parsed.length === 0) return null;
+
+const noonToday = new Date(dateStr + "T12:00:00+08:00");
+if (isNaN(noonToday.getTime())) return null;
+const noonYesterday = new Date(noonToday.getTime() - 24 * 3600 * 1000);
+const night = parsed.filter(s => s.dt >= noonYesterday && s.dt < noonToday);
+if (night.length === 0) return null;
+
+const sleepStart = night[0].dt;
+const last = night[night.length - 1];
+const sleepEnd = new Date(last.dt.getTime() + last.dur * 60_000);
+const totalMin = Math.max(0, Math.round((sleepEnd - sleepStart) / 60000));
+
+const stages = { Core: 0, Deep: 0, REM: 0, Awake: 0 };
+for (const s of night) stages[s.val] += s.dur;
+
+// HH:MM 用东八区表示（worker 默认 UTC，+8h 后取 ISO 的 HH:mm 段）
+const fmt = d => new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(11, 16);
+
+return {
+sleep_start: fmt(sleepStart),
+sleep_end: fmt(sleepEnd),
+sleep_duration_min: totalMin,
+sleep_core_min: stages.Core,
+sleep_deep_min: stages.Deep,
+sleep_rem_min: stages.REM,
+sleep_awake_min: stages.Awake,
+};
+}
+
 async function handleHealth(request, env) {
 const url = new URL(request.url);
 const path = url.pathname;
@@ -5489,6 +5554,12 @@ return jsonResponse({ error: "body must be a JSON object" }, 400);
 }
 const date = (typeof body.date === "string" && body.date.length === 10) ? body.date : cnToday();
 const existing = (await kvGet(env, "health:" + date)) || { date };
+// sleep_samples → 7 个睡眠字段（见 docs/sleep-patch.md；不入库，只用一次）
+if (Array.isArray(body.sleep_samples)) {
+const parsed = parseSleepSamples(body.sleep_samples, date);
+if (parsed) Object.assign(body, parsed);
+delete body.sleep_samples;
+}
 const merged = { ...existing, date };
 for (const k of HEALTH_FIELDS) {
 // COALESCE：只有 null / undefined 跳过；0 是有效值，照常覆盖
