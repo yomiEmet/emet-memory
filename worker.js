@@ -5604,6 +5604,151 @@ return jsonResponse({ date: rec?.date || null, context: buildHealthContext(rec) 
 return jsonResponse({ error: "Not found" }, 404);
 }
 
+// ════════════════════════════════════════════════════════════
+// Web Push（VAPID 自签 ES256 + 无负载推送 + KV 单订阅）
+// 见 docs/阶段0-web-push.md
+// ════════════════════════════════════════════════════════════
+
+// base64url 编码（无 = 填充）。Uint8Array 或字符串都接。
+function b64uEncode(input) {
+let str;
+if (input instanceof Uint8Array) {
+let bin = "";
+for (let i = 0; i < input.length; i++) bin += String.fromCharCode(input[i]);
+str = btoa(bin);
+} else {
+str = btoa(input);
+}
+return str.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// VAPID JWT 签名（ES256 / ECDSA P-256 SHA-256 raw 64 字节）
+// audience：push service endpoint 的 origin（"https://web.push.apple.com" 等）
+// privateJwk：KV push:vapid.privateKey
+// contactEmail："mailto:..." 格式
+async function signVapidJWT(audience, privateJwk, contactEmail) {
+const header = { typ: "JWT", alg: "ES256" };
+const exp = Math.floor(Date.now() / 1000) + 12 * 3600; // 12h；VAPID 规范上限 24h
+const payload = { aud: audience, exp, sub: contactEmail };
+
+const headerB64 = b64uEncode(JSON.stringify(header));
+const payloadB64 = b64uEncode(JSON.stringify(payload));
+const signingInput = `${headerB64}.${payloadB64}`;
+
+const key = await crypto.subtle.importKey(
+"jwk", privateJwk,
+{ name: "ECDSA", namedCurve: "P-256" },
+false, ["sign"]
+);
+const sigBuf = await crypto.subtle.sign(
+{ name: "ECDSA", hash: "SHA-256" },
+key,
+new TextEncoder().encode(signingInput)
+);
+const sigB64 = b64uEncode(new Uint8Array(sigBuf));
+return `${signingInput}.${sigB64}`;
+}
+
+async function handlePush(request, env) {
+const url = new URL(request.url);
+const path = url.pathname;
+const method = request.method;
+
+// ── GET /api/push/vapid-public-key：前端订阅前拿公钥 ──
+if (path === "/api/push/vapid-public-key" && method === "GET") {
+const vapid = await kvGet(env, "push:vapid");
+if (!vapid?.publicKey) return jsonResponse({ error: "VAPID not initialized" }, 503);
+return jsonResponse({ publicKey: vapid.publicKey });
+}
+
+// ── POST /api/push/subscribe：注册订阅（覆盖式，单用户单条）──
+if (path === "/api/push/subscribe" && method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+if (!body || typeof body !== "object" || !body.endpoint || !body.keys?.p256dh || !body.keys?.auth) {
+return jsonResponse({ error: "invalid subscription: need endpoint + keys.p256dh + keys.auth" }, 400);
+}
+const item = {
+endpoint: String(body.endpoint),
+keys: { p256dh: String(body.keys.p256dh), auth: String(body.keys.auth) },
+ua: request.headers.get("user-agent") || "",
+subscribedAt: now(),
+};
+await kvPut(env, "push:subscription", item);
+return jsonResponse({ success: true, item });
+}
+
+// ── DELETE /api/push/subscribe：退订 ──
+if (path === "/api/push/subscribe" && method === "DELETE") {
+await env.MEMORY.delete("push:subscription");
+return jsonResponse({ success: true });
+}
+
+// ── POST /api/push/send：写最新内容 + 触发无负载推送 ──
+// body: { title, body, url?, source? }
+if (path === "/api/push/send" && method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+if (!body || typeof body !== "object" || !body.title || !body.body) {
+return jsonResponse({ error: "title and body required" }, 400);
+}
+const notification = {
+title: String(body.title),
+body: String(body.body),
+url: typeof body.url === "string" ? body.url : "/",
+createdAt: now(),
+source: typeof body.source === "string" ? body.source : "manual",
+};
+await kvPut(env, "push:notification:latest", notification);
+
+const sub = await kvGet(env, "push:subscription");
+if (!sub?.endpoint) {
+return jsonResponse({ success: false, reason: "no subscription", notification }, 404);
+}
+const vapid = await kvGet(env, "push:vapid");
+if (!vapid?.privateKey || !vapid?.publicKey) {
+return jsonResponse({ error: "VAPID not initialized" }, 503);
+}
+
+const audience = new URL(sub.endpoint).origin;
+const jwt = await signVapidJWT(audience, vapid.privateKey, "mailto:aandxiaobao@gmail.com");
+
+const pushResp = await fetch(sub.endpoint, {
+method: "POST",
+headers: {
+"Authorization": `vapid t=${jwt}, k=${vapid.publicKey}`,
+"TTL": "60",
+"Urgency": "normal",
+"Content-Length": "0",
+},
+});
+
+if (pushResp.status === 201 || pushResp.status === 204) {
+return jsonResponse({ success: true, notification, pushStatus: pushResp.status });
+}
+if (pushResp.status === 404 || pushResp.status === 410) {
+// 订阅过期：清掉，等用户重新订阅
+await env.MEMORY.delete("push:subscription");
+return jsonResponse({ success: false, reason: "expired", pushStatus: pushResp.status });
+}
+const respText = await pushResp.text().catch(() => "");
+return jsonResponse(
+{ success: false, pushStatus: pushResp.status, pushBody: respText },
+pushResp.status >= 500 ? 502 : pushResp.status
+);
+}
+
+// ── GET /api/push/latest：SW 在 push 事件里拉最新内容 ──
+if (path === "/api/push/latest" && method === "GET") {
+const notification = await kvGet(env, "push:notification:latest");
+return jsonResponse({ notification: notification || null });
+}
+
+return jsonResponse({ error: "Not found" }, 404);
+}
+
 async function routeRequest(request, env, ctx) {
 const url = new URL(request.url);
 const path = url.pathname;
@@ -5627,6 +5772,11 @@ if (path === "/sse") return handleSSE(request, env);
 if (path === "/api/health" || path.startsWith("/api/health/")) {
 if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
 return handleHealth(request, env);
+}
+// ── Web Push：双鉴权同上（SW fetch /api/push/latest 也走这个闸门，靠 X-Admin-Key 从 IndexedDB 读）──
+if (path.startsWith("/api/push/")) {
+if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+return handlePush(request, env);
 }
 // ── 统一鉴权闸门：/api/* 全部要求 X-Admin-Key ──
 // 仅豁免 /api/auth（验密接口本身）；/health、/play/、/icon.png 路径不匹配，不受影响
