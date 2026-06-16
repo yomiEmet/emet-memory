@@ -1,10 +1,22 @@
 // 一次性脚本：生成 VAPID 密钥对，输出可直接写入 KV push:vapid 的 JSON。
 //
-// 用法：
+// 用法（PowerShell 5.1 / 7 通用 BOM-safe 写法）：
 //   cd C:\Users\Administrator\Desktop\emet-memory
-//   node scripts/generate-vapid.mjs > vapid.json
+//   $json = node scripts/generate-vapid.mjs | Out-String
+//   [System.IO.File]::WriteAllText("$PWD\vapid.json", $json.TrimEnd(), (New-Object System.Text.UTF8Encoding $false))
 //   npx wrangler kv key put --namespace-id=d5a8437042e54a379258239d947b99db --remote "push:vapid" --path=vapid.json
 //   Remove-Item vapid.json
+//
+// 用法（bash/zsh / Linux & macOS）：
+//   cd ~/Desktop/emet-memory
+//   node scripts/generate-vapid.mjs > vapid.json
+//   npx wrangler kv key put --namespace-id=d5a8437042e54a379258239d947b99db --remote "push:vapid" --path=vapid.json
+//   rm vapid.json
+//
+// ⚠ PowerShell 5.1 下千万别用 `node ... > vapid.json`（默认写 UTF-16 LE BOM）
+//   或 `Out-File -Encoding utf8`（PS 5.1 该选项写的是 UTF-8 BOM）。
+//   两种 BOM 进 KV 后 worker.js 的 JSON.parse 都会抛 SyntaxError → Cloudflare 1101。
+//   bash/zsh 下 `>` 重定向是干净 UTF-8（无 BOM），安全。
 //
 // 输出结构（直接是 KV push:vapid 的 value，worker 端 kvGet("push:vapid") 拿到的就是这个）：
 //   {
