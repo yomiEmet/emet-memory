@@ -5428,6 +5428,103 @@ return withCors(res, request);
 }
 };
 
+// ════════════════════════════════════════════════════════════
+// 健康数据（Apple Watch via iOS 快捷指令）
+// KV：health:<YYYY-MM-DD> → 当日健康数据 JSON（COALESCE 分次合并）
+// 鉴权：复用 checkMcpAuth（X-Admin-Key 头 或 ?key= 查询参数）；
+//       在 routeRequest 的 /api/* 闸门「之前」自鉴权，故支持 URL 参数。
+// ════════════════════════════════════════════════════════════
+const HEALTH_FIELDS = [
+"heart_rate", "resting_heart_rate", "hrv", "steps",
+"sleep_start", "sleep_end", "sleep_duration_min",
+"sleep_deep_min", "sleep_rem_min", "sleep_core_min", "sleep_awake_min",
+"active_calories",
+];
+
+// 东八区当天日期（worker 默认 UTC，会把中国凌晨算成昨天，故 +8h）
+function cnToday() {
+return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+// 健康数据 → 给 AI 的自然语言摘要（注入 system prompt）
+function buildHealthContext(rec) {
+if (!rec) return "";
+const hints = [];
+if (typeof rec.hrv === "number") {
+if (rec.hrv < 25) hints.push("身体应激状态");
+else if (rec.hrv >= 55) hints.push("状态不错");
+}
+if (typeof rec.sleep_duration_min === "number" && rec.sleep_duration_min < 5.5 * 60) {
+hints.push("睡眠不足");
+}
+if (typeof rec.steps === "number" && rec.steps < 2000) {
+hints.push("今天活动量很少");
+}
+return hints.join("；");
+}
+
+// 取「最近一天有数据」的记录：只列 key（不取 value，便宜），ISO 日期升序取最后一个
+async function getLatestHealth(env) {
+let cursor = null, lastKey = null;
+do {
+const l = await env.MEMORY.list({ prefix: "health:", cursor });
+if (l.keys.length) lastKey = l.keys[l.keys.length - 1].name;
+cursor = l.list_complete ? null : l.cursor;
+} while (cursor);
+return lastKey ? await kvGet(env, lastKey) : null;
+}
+
+async function handleHealth(request, env) {
+const url = new URL(request.url);
+const path = url.pathname;
+const method = request.method;
+
+// ── POST /api/health：接收 + COALESCE 合并（支持分多次上报）──
+if (path === "/api/health" && method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+if (!body || typeof body !== "object" || Array.isArray(body)) {
+return jsonResponse({ error: "body must be a JSON object" }, 400);
+}
+const date = (typeof body.date === "string" && body.date.length === 10) ? body.date : cnToday();
+const existing = (await kvGet(env, "health:" + date)) || { date };
+const merged = { ...existing, date };
+for (const k of HEALTH_FIELDS) {
+// COALESCE：只有 null / undefined 跳过；0 是有效值，照常覆盖
+if (body[k] !== undefined && body[k] !== null) merged[k] = body[k];
+}
+merged.updated_at = now();
+await kvPut(env, "health:" + date, merged);
+return jsonResponse({ success: true, item: merged });
+}
+
+// ── GET /api/health?days=7：最近 N 天（默认 7，最大 30，按日期倒序）──
+if (path === "/api/health" && method === "GET") {
+const days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "7", 10) || 7, 1), 30);
+const base = Date.now() + 8 * 3600 * 1000;
+const dates = Array.from({ length: days }, (_, i) =>
+new Date(base - i * 86400000).toISOString().slice(0, 10)
+);
+const recs = await Promise.all(dates.map(d => kvGet(env, "health:" + d)));
+const records = recs.filter(Boolean);
+return jsonResponse({ days, count: records.length, records });
+}
+
+// ── GET /api/health/latest：最近一天有数据的记录（前端主页用）──
+if (path === "/api/health/latest" && method === "GET") {
+return jsonResponse({ record: await getLatestHealth(env) });
+}
+
+// ── GET /api/health/context：给 AI 的自然语言健康摘要 ──
+if (path === "/api/health/context" && method === "GET") {
+const rec = await getLatestHealth(env);
+return jsonResponse({ date: rec?.date || null, context: buildHealthContext(rec) });
+}
+
+return jsonResponse({ error: "Not found" }, 404);
+}
+
 async function routeRequest(request, env, ctx) {
 const url = new URL(request.url);
 const path = url.pathname;
@@ -5446,6 +5543,12 @@ if (!checkMcpAuth(request, env)) return mcpUnauthorized();
 }
 if (path === "/mcp" && request.method === "POST") return handleMCP(request, env);
 if (path === "/sse") return handleSSE(request, env);
+// ── 健康数据：双鉴权（X-Admin-Key 或 ?key=），放在 /api/* 闸门之前自鉴权 ──
+// 原因：下面的统一闸门 checkAuth 只认请求头，会挡掉 iOS 快捷指令的 ?key=。
+if (path === "/api/health" || path.startsWith("/api/health/")) {
+if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+return handleHealth(request, env);
+}
 // ── 统一鉴权闸门：/api/* 全部要求 X-Admin-Key ──
 // 仅豁免 /api/auth（验密接口本身）；/health、/play/、/icon.png 路径不匹配，不受影响
 // 注意必须放在下面六个旁路维护路由之前，否则它们绕过鉴权
