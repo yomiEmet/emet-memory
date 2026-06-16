@@ -5477,10 +5477,18 @@ return lastKey ? await kvGet(env, lastKey) : null;
 // ── Sleep Analysis 样本归一化与拼装（见 docs/sleep-patch.md）──
 // 不同 iOS / locale / 数据源给出的 Value 标签字符串不一致，全部映射到 4 个规范类别。
 const SLEEP_LABELS = {
+// Core
 "Core": "Core", "Asleep Core": "Core", "AsleepCore": "Core", "Asleep (Core)": "Core",
+"核心睡眠": "Core", "核心": "Core",
+// Deep
 "Deep": "Deep", "Asleep Deep": "Deep", "AsleepDeep": "Deep", "Asleep (Deep)": "Deep",
-"REM":  "REM",  "Asleep REM":  "REM",  "AsleepREM":  "REM",  "Asleep (REM)":  "REM",
+"深度睡眠": "Deep", "深度": "Deep",
+// REM
+"REM": "REM", "Asleep REM": "REM", "AsleepREM": "REM", "Asleep (REM)": "REM",
+"快速眼动睡眠": "REM", "REM 睡眠": "REM", "REM睡眠": "REM", "快速眼动": "REM",
+// Awake / In Bed
 "Awake": "Awake", "In Bed": "Awake", "InBed": "Awake",
+"清醒时间": "Awake", "清醒": "Awake", "在床": "Awake", "卧床": "Awake",
 };
 
 // 把 iOS Shortcuts 上报的 sleep sample 数组拼成 7 个睡眠字段。
