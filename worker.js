@@ -5832,6 +5832,33 @@ body: { success: false, pushStatus: pushResp.status, pushBody: respText },
 };
 }
 
+// 把 night-guard 文案追加到"最近活跃会话"作为 AI 最新消息
+// "最近活跃" = 所有 chat:* 里 deleted!=true 且 updated_at 最大的那个
+// 返回 { ok, sessionId?, mid?, reason? }；KV 失败由调用方 try/catch 兜
+async function appendToActiveSession(env, messageText) {
+const all = await kvListByPrefix(env, "chat:");
+const active = all
+.filter(s => !s.deleted && Array.isArray(s.messages))
+.sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""))[0];
+if (!active) return { ok: false, reason: "no-active-session" };
+
+const ts = new Date().toISOString();
+const msg = {
+mid: "m" + Date.now().toString(36) + "ng",
+ts,
+role: "assistant",
+content: messageText,
+source: "night-guard",
+};
+const updated = {
+...active,
+messages: [...active.messages, msg],
+updated_at: ts,
+};
+await kvPut(env, "chat:" + active.id, updated);
+return { ok: true, sessionId: active.id, mid: msg.mid };
+}
+
 // 事件接收 + 凌晨守护触发链
 async function handleEvents(request, env) {
 const url = new URL(request.url);
@@ -5922,14 +5949,23 @@ llmError = String(e?.message || e);
 message = "凌晨了，快去睡。"; // 兜底
 }
 
+// 追加到最近活跃会话，让 LLM 文案作为 AI 最新消息出现在聊天里
+// 失败只记 log，不挡主推送路径
+let sessionAppend;
+try {
+sessionAppend = await appendToActiveSession(env, message);
+} catch (e) {
+sessionAppend = { ok: false, reason: "append-failed", error: String(e?.message || e) };
+}
+
 const pushResult = await sendPushNotification(env, {
 title: "Emet",
 body: message,
-url: "/",
+url: "/chat",
 source: "night-guard",
 });
 
-// 7d 日志：prompt + LLM 回复 + push 结果
+// 7d 日志：prompt + LLM 回复 + 会话追加结果 + push 结果
 const logEntry = {
 ts: eventTs,
 hhmm,
@@ -5937,6 +5973,7 @@ app: value,
 prompt,
 message,
 llmError,
+sessionAppend,
 pushResult: pushResult.body,
 };
 await env.MEMORY.put(
@@ -5955,6 +5992,7 @@ triggered: true,
 hhmm,
 message,
 llmError,
+sessionAppend,
 pushSuccess: pushResult.body.success === true,
 pushReason: pushResult.body.reason || null,
 });
