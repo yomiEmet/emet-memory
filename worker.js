@@ -5493,9 +5493,15 @@ return `${d.getUTCMonth() + 1}.${d.getUTCDate()}`;
 }
 
 // 拉最近 N 篇某个 author 的 diary（按 diary_date 倒序），供承上启下
-async function fetchRecentByAuthor(env, author, limit) {
+// beforeDate 可选：严格时序——只返回 diary_date < beforeDate 的，避免回填时把"未来"周记当 prior
+async function fetchRecentByAuthor(env, author, limit, beforeDate) {
 const all = (await kvListByPrefix(env, "diary:"))
 .filter(d => d.author === author)
+.filter(d => {
+if (!beforeDate) return true;
+const dd = d.diary_date || (d.created_at || "").slice(0, 10);
+return dd < beforeDate;
+})
 .sort((a, b) => {
 const ka = a.diary_date || a.created_at || "";
 const kb = b.diary_date || b.created_at || "";
@@ -5609,8 +5615,9 @@ return { skipped: true, reason: "no-source", range: [startStr, endStr] };
 const prevHealthRecords = await fetchHealthRecords(env, prevStartStr, prevEndStr);
 const prevHealthSummary = summarizeHealthForReview(prevHealthRecords);
 // 承上启下：拉最近 2 篇周记 + 1 篇月记当 prior reviews
-const recentWeeklies = await fetchRecentByAuthor(env, "weekly", 2);
-const recentMonthly = await fetchRecentByAuthor(env, "monthly", 1);
+// 严格时序：只取 diary_date < startStr 的，避免回填时把未来周记当 prior
+const recentWeeklies = await fetchRecentByAuthor(env, "weekly", 2, startStr);
+const recentMonthly = await fetchRecentByAuthor(env, "monthly", 1, startStr);
 const priorReviews = [...recentWeeklies, ...recentMonthly];
 const formatted = formatMaterial(material);
 const weekN = isoWeekOfYear(endStr);
@@ -5672,9 +5679,10 @@ return { skipped: true, reason: "no-source", range: [startStr, endStr] };
 
 const prevHealthRecords = await fetchHealthRecords(env, prevStartStr, prevEndStr);
 const prevHealthSummary = summarizeHealthForReview(prevHealthRecords);
-// 承上启下：月记拉最近 4 篇周记（覆盖本月每周的回顾）+ 1 篇月记（上月）
-const recentWeeklies = await fetchRecentByAuthor(env, "weekly", 4);
-const recentMonthly = await fetchRecentByAuthor(env, "monthly", 1);
+// 承上启下：月记拉最近 4 篇周记 + 1 篇月记（上月）
+// 严格时序：只取 diary_date < startStr 的
+const recentWeeklies = await fetchRecentByAuthor(env, "weekly", 4, startStr);
+const recentMonthly = await fetchRecentByAuthor(env, "monthly", 1, startStr);
 const priorReviews = [...recentWeeklies, ...recentMonthly];
 const formatted = formatMaterial(material);
 const prompt = buildReviewPrompt({
