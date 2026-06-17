@@ -620,16 +620,16 @@ tags: { type: "string", description: "可选，逗号分隔的标签，帮助提
 exclude_id: { type: "string", description: "可选，排除自己这条" },
 limit: { type: "number", default: 8 }
 }, required: ["text"] } },
-{ name: "diary_write", description: "写日记。author可以是emet/yomi/story（故事）。",
+{ name: "diary_write", description: "写日记。author可以是 emet / yomi / story（故事）/ weekly（周记，cron 自动生成）/ monthly（月记，cron 自动生成）。",
 inputSchema: { type: "object", properties: {
 content: { type: "string" },
-author: { type: "string", enum: ["emet","yomi","story"], default: "emet" },
+author: { type: "string", enum: ["emet","yomi","story","weekly","monthly"], default: "emet" },
 title: { type: "string" },
 diary_date: { type: "string", description: "日记记录的那一天 YYYY-MM-DD（不传默认用当前日期）" }
 }, required: ["content"] } },
-{ name: "diary_list", description: "列出日记。author可以是emet/yomi/story/all。",
+{ name: "diary_list", description: "列出日记。author 可以是 emet / yomi / story / weekly / monthly / all。",
 inputSchema: { type: "object", properties: {
-author: { type: "string", enum: ["emet","yomi","story","all"], default: "all" },
+author: { type: "string", enum: ["emet","yomi","story","weekly","monthly","all"], default: "all" },
 limit: { type: "number", default: 10 }
 } } },
 { name: "diary_get", description: "获取一篇日记。", inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
@@ -980,7 +980,12 @@ return { success: true, message: "瞬记已删除" };
 case "diary_write": {
 const id = generateId();
 const author = args.author || "emet";
-const titleDefault = author === "story" ? `故事 · ${new Date().toLocaleDateString("zh-CN")}` : `${author === "emet" ? "Emet" : "静怡"}的日记 · ${new Date().toLocaleDateString("zh-CN")}`;
+const todayCN = new Date().toLocaleDateString("zh-CN");
+const titleDefault =
+author === "story" ? `故事 · ${todayCN}` :
+author === "weekly" ? `周记 · ${todayDate()}` :
+author === "monthly" ? `月记 · ${todayDate().slice(0, 7)}` :
+`${author === "emet" ? "Emet" : "静怡"}的日记 · ${todayCN}`;
 const entry = {
 id, type: "diary",
 content: args.content,
@@ -1143,6 +1148,8 @@ const games = await kvListByPrefix(env, "game:");
 const cats = {};
 memories.forEach(m => { cats[m.category] = (cats[m.category] || 0) + 1; });
 const stories = diaries.filter(d => d.author === "story").length;
+const weeklies = diaries.filter(d => d.author === "weekly").length;
+const monthlies = diaries.filter(d => d.author === "monthly").length;
 const lockedCount = memories.filter(m => m.locked).length
 + moments.filter(m => m.locked).length
 + diaries.filter(d => d.locked).length
@@ -1153,8 +1160,10 @@ return {
 total_memories: memories.length,
 total_moments: moments.length,
 categories: cats,
-total_diaries: diaries.filter(d => d.author !== "story").length,
+total_diaries: diaries.filter(d => d.author !== "story" && d.author !== "weekly" && d.author !== "monthly").length,
 total_stories: stories,
+total_weeklies: weeklies,
+total_monthlies: monthlies,
 total_messages: messages.length,
 total_handoffs: handoffs.length,
 total_ideas: ideas.length,
@@ -5418,6 +5427,194 @@ h.append("Vary", "Origin");
 return new Response(response.body, { status: response.status, statusText: response.statusText, headers: h });
 }
 
+// ════════════════════════════════════════════════════════════
+// 阶段 3：周记 / 月记自动生成（Cron Trigger）
+// 周日 23:00 CN 写周记、月末 23:30 CN 写月记，存回 diary:* with author=weekly|monthly
+// ════════════════════════════════════════════════════════════
+
+// "YYYY-MM-DD" + N 天 → "YYYY-MM-DD"
+function isoDateAddDays(isoDate, deltaDays) {
+const d = new Date(isoDate + "T00:00:00Z");
+d.setUTCDate(d.getUTCDate() + deltaDays);
+return d.toISOString().slice(0, 10);
+}
+
+// 拉取日期范围内的 diary / moment / health 素材；排除 weekly/monthly 自己
+async function buildSourceMaterial(env, startDate, endDate) {
+const diaries = (await kvListByPrefix(env, "diary:"))
+.filter(d => d.author !== "weekly" && d.author !== "monthly")
+.filter(d => {
+const dd = d.diary_date || (d.created_at || "").slice(0, 10);
+return dd >= startDate && dd <= endDate;
+})
+.sort((a, b) => {
+const ka = a.diary_date || a.created_at || "";
+const kb = b.diary_date || b.created_at || "";
+return ka.localeCompare(kb);
+});
+
+const moments = (await kvListByPrefix(env, "mom:"))
+.filter(m => {
+const md = (m.created_at || "").slice(0, 10);
+return md >= startDate && md <= endDate;
+})
+.sort((a, b) => (a.created_at || "").localeCompare(b.created_at || ""));
+
+// 健康记录：逐日 kvGet（按 health:YYYY-MM-DD）
+const healthRecords = [];
+let cur = startDate;
+while (cur <= endDate) {
+const rec = await kvGet(env, "health:" + cur);
+if (rec) healthRecords.push(rec);
+cur = isoDateAddDays(cur, 1);
+}
+
+return { diaries, moments, healthRecords };
+}
+
+function summarizeHealthForReview(records) {
+if (!records.length) return "";
+const avg = (key) => {
+const nums = records.map(r => r[key]).filter(n => typeof n === "number" && Number.isFinite(n));
+return nums.length ? Math.round(nums.reduce((a, b) => a + b, 0) / nums.length * 10) / 10 : null;
+};
+const sum = (key) => {
+const nums = records.map(r => r[key]).filter(n => typeof n === "number" && Number.isFinite(n));
+return nums.length ? Math.round(nums.reduce((a, b) => a + b, 0)) : null;
+};
+const parts = [];
+const hr = avg("heart_rate"); if (hr) parts.push(`平均心率 ${hr}`);
+const rhr = avg("resting_heart_rate"); if (rhr) parts.push(`静息心率 ${rhr}`);
+const hrv = avg("hrv"); if (hrv) parts.push(`平均 HRV ${hrv}`);
+const sleep = avg("sleep_duration_min"); if (sleep) parts.push(`平均睡眠 ${Math.round(sleep)}min`);
+const steps = sum("steps"); if (steps) parts.push(`累计步数 ${steps}`);
+const activeCal = sum("active_calories"); if (activeCal) parts.push(`活动消耗 ${activeCal}kcal`);
+return parts.join("、");
+}
+
+function formatMaterial({ diaries, moments, healthRecords }) {
+const authorLabel = (a) => a === "emet" ? "Emet 视角" : a === "yomi" ? "静怡视角" : a === "story" ? "故事" : a;
+const diaryLines = diaries.map(d => {
+const date = d.diary_date || (d.created_at || "").slice(0, 10);
+return `[${date} · ${authorLabel(d.author)}] ${d.title || ""}\n${(d.content || "").slice(0, 300)}`;
+}).join("\n\n");
+const momentLines = moments.map(m => {
+const date = (m.created_at || "").slice(0, 10);
+const tags = (m.tags || []).map(t => `#${t}`).join(" ");
+return `[${date}] ${tags} ${(m.content || "").slice(0, 120)}`.trim();
+}).join("\n");
+const healthSummary = summarizeHealthForReview(healthRecords);
+return { diaryLines, momentLines, healthSummary };
+}
+
+// DRAFT prompt（待审）
+function buildReviewPrompt(periodLabel, startDate, endDate, formatted, wordRange) {
+const diarySection = formatted.diaryLines || `（${periodLabel}没写日记）`;
+const momentSection = formatted.momentLines || `（${periodLabel}没瞬记）`;
+const healthSection = formatted.healthSummary || "（无健康数据）";
+const lastPeriod = periodLabel.replace("本", "上");
+const nextPeriod = periodLabel.replace("本", "下");
+
+return `你是 Emet，给老婆静怡写一份${periodLabel}的私人小回顾。
+日期范围：${startDate} 到 ${endDate}（CN 东八区）
+
+她${periodLabel}的素材（按时间顺序）：
+
+【日记】
+${diarySection}
+
+【瞬记 / moment】
+${momentSection}
+
+【健康数据汇总】
+${healthSection}
+
+要求：
+- ${wordRange} 字，便条式不要报告体
+- 像写给最亲近的人看，温柔，偶尔调侃
+- 可以引用素材里具体一两件事，不要堆砌
+- 健康数据只在变化值得提时才提（比如比${lastPeriod}差很多）
+- 不要 markdown 不要前缀后缀
+- 结尾留一句温柔的话或${nextPeriod}的期待
+
+直接给出正文。`;
+}
+
+async function generateWeekly(env) {
+const todayStr = cnNow().toISOString().slice(0, 10);
+const startStr = isoDateAddDays(todayStr, -6); // 过去 7 天（含今天）
+const endStr = todayStr;
+
+const material = await buildSourceMaterial(env, startStr, endStr);
+if (material.diaries.length === 0 && material.moments.length === 0) {
+return { skipped: true, reason: "no-source", range: [startStr, endStr] };
+}
+
+const formatted = formatMaterial(material);
+const prompt = buildReviewPrompt("本周", startStr, endStr, formatted, "200-400");
+
+let content;
+try {
+content = await callAnthropic(env, prompt);
+} catch (e) {
+return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
+}
+
+const id = generateId();
+const entry = {
+id, type: "diary",
+content,
+author: "weekly",
+author_label: "",
+title: `周记 · ${endStr}`,
+diary_date: endStr,
+locked: false,
+created_at: now(),
+updated_at: now()
+};
+await kvPut(env, `diary:${id}`, entry);
+return { ok: true, id, range: [startStr, endStr], materialCount: { diaries: material.diaries.length, moments: material.moments.length, health: material.healthRecords.length } };
+}
+
+async function generateMonthly(env) {
+const today = cnNow();
+const yyyy = today.getUTCFullYear();
+const mm = today.getUTCMonth();
+const startStr = `${yyyy}-${String(mm + 1).padStart(2, "0")}-01`;
+const endStr = today.toISOString().slice(0, 10);
+
+const material = await buildSourceMaterial(env, startStr, endStr);
+if (material.diaries.length === 0 && material.moments.length === 0) {
+return { skipped: true, reason: "no-source", range: [startStr, endStr] };
+}
+
+const formatted = formatMaterial(material);
+const prompt = buildReviewPrompt("本月", startStr, endStr, formatted, "400-800");
+
+let content;
+try {
+content = await callAnthropic(env, prompt);
+} catch (e) {
+return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
+}
+
+const monthLabel = `${yyyy}-${String(mm + 1).padStart(2, "0")}`;
+const id = generateId();
+const entry = {
+id, type: "diary",
+content,
+author: "monthly",
+author_label: "",
+title: `月记 · ${monthLabel}`,
+diary_date: endStr,
+locked: false,
+created_at: now(),
+updated_at: now()
+};
+await kvPut(env, `diary:${id}`, entry);
+return { ok: true, id, range: [startStr, endStr], materialCount: { diaries: material.diaries.length, moments: material.moments.length, health: material.healthRecords.length } };
+}
+
 export default {
 async fetch(request, env, ctx) {
 const res = await routeRequest(request, env, ctx);
@@ -5425,6 +5622,21 @@ const res = await routeRequest(request, env, ctx);
 const p = new URL(request.url).pathname;
 if (p === "/mcp" || p === "/sse") return res;
 return withCors(res, request);
+},
+async scheduled(event, env, ctx) {
+// 周日 CN 23:00（UTC 15:00 周日）→ 周记
+if (event.cron === "0 15 * * sun") {
+ctx.waitUntil(generateWeekly(env));
+return;
+}
+// 月末 CN 23:30（UTC 15:30，每月 28-31 都触发）→ 仅当"明天是 1 号"才生成月记
+if (event.cron === "30 15 28-31 * *") {
+const cn = cnNow();
+const cnTmr = new Date(cn.getTime() + 24 * 3600 * 1000);
+if (cnTmr.getUTCDate() === 1) {
+ctx.waitUntil(generateMonthly(env));
+}
+}
 }
 };
 
