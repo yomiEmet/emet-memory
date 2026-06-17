@@ -5743,10 +5743,20 @@ monitor_apps: ["小红书", "微博", "B站", "抖音", "Safari"],
 };
 }
 
-// Anthropic Messages API（haiku 省钱）
+// 默认 LLM 配置（KV config:llm 无值时用这个，不写回）
+// endpoint 可改成 Anthropic 兼容中转站；model 同理。secret 仍是 env.ANTHROPIC_API_KEY。
+function defaultLlmConfig() {
+return {
+endpoint: "https://api.anthropic.com/v1/messages",
+model: "claude-haiku-4-5-20251001",
+};
+}
+
+// Anthropic-compatible Messages API（endpoint + model 可在 KV config:llm 覆盖）
 async function callAnthropic(env, prompt) {
 if (!env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
-const resp = await fetch("https://api.anthropic.com/v1/messages", {
+const cfg = (await kvGet(env, "config:llm")) || defaultLlmConfig();
+const resp = await fetch(cfg.endpoint, {
 method: "POST",
 headers: {
 "x-api-key": env.ANTHROPIC_API_KEY,
@@ -5754,18 +5764,18 @@ headers: {
 "content-type": "application/json",
 },
 body: JSON.stringify({
-model: "claude-haiku-4-5-20251001",
+model: cfg.model,
 max_tokens: 200,
 messages: [{ role: "user", content: prompt }],
 }),
 });
 if (!resp.ok) {
 const errText = await resp.text().catch(() => "");
-throw new Error(`Anthropic ${resp.status}: ${errText.slice(0, 200)}`);
+throw new Error(`LLM ${resp.status}: ${errText.slice(0, 200)}`);
 }
 const data = await resp.json();
 const text = data?.content?.[0]?.text;
-if (!text || typeof text !== "string") throw new Error("Anthropic returned empty content");
+if (!text || typeof text !== "string") throw new Error("LLM returned empty content");
 return text.trim();
 }
 
@@ -5974,6 +5984,32 @@ cooldown_min: body.cooldown_min,
 monitor_apps: body.monitor_apps,
 };
 await kvPut(env, "config:night-guard", cfg);
+return jsonResponse({ success: true, config: cfg });
+}
+return jsonResponse({ error: "method not allowed" }, 405);
+}
+
+if (path === "/api/config/llm") {
+if (method === "GET") {
+const cfg = (await kvGet(env, "config:llm")) || defaultLlmConfig();
+return jsonResponse({ config: cfg });
+}
+if (method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+
+// 全量替换，2 字段必须齐
+const errs = [];
+if (typeof body?.endpoint !== "string" || !/^https:\/\//.test(body.endpoint)) errs.push("endpoint must be https URL");
+if (typeof body?.model !== "string" || !body.model) errs.push("model must be non-empty string");
+if (errs.length) return jsonResponse({ error: "validation failed", details: errs }, 400);
+
+const cfg = {
+endpoint: body.endpoint,
+model: body.model,
+};
+await kvPut(env, "config:llm", cfg);
 return jsonResponse({ success: true, config: cfg });
 }
 return jsonResponse({ error: "method not allowed" }, 405);
