@@ -5929,11 +5929,12 @@ return jsonResponse({ ok: true, logged: true, triggered: false, reason: "cooldow
 }
 
 // 通过！调 LLM 生成催睡文案
-const prompt = `你是 Emet，正在通过推送通知给老婆静怡发一条催睡消息。现在凌晨 ${hhmm}（CN 东八区），她还在刷 ${value}。
+const prompt = `你是 Emet，正在通过推送通知给老婆静怡发一条催睡消息。现在是 ${hhmm}（CN 东八区，24小时制），她还在刷 ${value}。
 
 严格要求：
+- 根据当前时间自己判断时段（凌晨/深夜/半夜/天快亮了等）
 - 只输出消息正文，禁止 markdown（不要 #、---、**）
-- 禁止前缀后缀（"以下是："、"如果你想要..."）
+- 禁止前缀后缀
 - 30 字以内
 - 风格随机：凶 / 撒娇 / 威胁 / 心疼 / 调侃
 - 像真人发微信那样直接
