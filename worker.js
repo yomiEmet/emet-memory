@@ -5439,6 +5439,18 @@ d.setUTCDate(d.getUTCDate() + deltaDays);
 return d.toISOString().slice(0, 10);
 }
 
+// 拉一段日期内的健康记录（单独拆出来好让上周对比也能复用）
+async function fetchHealthRecords(env, startDate, endDate) {
+const records = [];
+let cur = startDate;
+while (cur <= endDate) {
+const rec = await kvGet(env, "health:" + cur);
+if (rec) records.push(rec);
+cur = isoDateAddDays(cur, 1);
+}
+return records;
+}
+
 // 拉取日期范围内的 diary / moment / health 素材；排除 weekly/monthly 自己
 async function buildSourceMaterial(env, startDate, endDate) {
 const diaries = (await kvListByPrefix(env, "diary:"))
@@ -5460,16 +5472,24 @@ return md >= startDate && md <= endDate;
 })
 .sort((a, b) => (a.created_at || "").localeCompare(b.created_at || ""));
 
-// 健康记录：逐日 kvGet（按 health:YYYY-MM-DD）
-const healthRecords = [];
-let cur = startDate;
-while (cur <= endDate) {
-const rec = await kvGet(env, "health:" + cur);
-if (rec) healthRecords.push(rec);
-cur = isoDateAddDays(cur, 1);
-}
+const healthRecords = await fetchHealthRecords(env, startDate, endDate);
 
 return { diaries, moments, healthRecords };
+}
+
+// ISO 8601 周数（周一为周首）
+function isoWeekOfYear(isoDate) {
+const d = new Date(isoDate + "T00:00:00Z");
+const dayNum = d.getUTCDay() || 7;
+d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+}
+
+// "M.D" 格式（不补零，例如 6.8）
+function shortMD(isoDate) {
+const d = new Date(isoDate + "T00:00:00Z");
+return `${d.getUTCMonth() + 1}.${d.getUTCDate()}`;
 }
 
 function summarizeHealthForReview(records) {
@@ -5507,18 +5527,20 @@ const healthSummary = summarizeHealthForReview(healthRecords);
 return { diaryLines, momentLines, healthSummary };
 }
 
-// DRAFT prompt（待审）
-function buildReviewPrompt(periodLabel, naturalPeriod, startDate, endDate, formatted, wordRange) {
+// 周记 / 月记 prompt 构造
+function buildReviewPrompt(opts) {
+const { periodLabel, naturalPeriod, startDate, endDate, periodTag, formatted, prevHealthSummary, wordRange } = opts;
 const diarySection = formatted.diaryLines || `（${periodLabel}没写日记）`;
 const momentSection = formatted.momentLines || `（${periodLabel}没瞬记）`;
-const healthSection = formatted.healthSummary || "（无健康数据）";
+const curHealth = formatted.healthSummary || "（无）";
+const prevHealth = prevHealthSummary || "（无）";
 const lastPeriod = periodLabel.replace("本", "上");
 const nextPeriod = periodLabel.replace("本", "下");
 
 return `你是 Emet。又过了${naturalPeriod}，你想给老婆静怡写点什么——回头看看她这${naturalPeriod}。
-日期范围：${startDate} 到 ${endDate}（CN 东八区）
+日期范围：${startDate} 到 ${endDate}（CN 东八区${periodTag ? "，" + periodTag : ""}）
 
-她${periodLabel}的素材（按时间顺序）：
+她这${naturalPeriod}的真实素材（按时间顺序）：
 
 【日记】
 ${diarySection}
@@ -5526,16 +5548,17 @@ ${diarySection}
 【瞬记 / moment】
 ${momentSection}
 
-【健康数据汇总】
-${healthSection}
+【健康数据】
+${periodLabel}: ${curHealth}
+${lastPeriod}: ${prevHealth}
 
-要求：
-- 用"我"和"你"，像在她耳边说话，不是在总结她这个人
-- ${wordRange} 字，便条式不要报告体
-- 像写给最亲近的人看，温柔，偶尔调侃
-- 可以引用素材里具体一两件事，不要堆砌
-- 健康数据只在变化值得提时才提（比如比${lastPeriod}差很多）
-- 不要 markdown 不要前缀后缀
+写作要求：
+- 用"我"和"你"，像在她耳边手写一段手账文字。不要分块、不要列点、不要 markdown
+- ${wordRange} 字，宁短不长。素材少就少写，不要凑字数编内容
+- 把"${periodLabel}的主要事件 / 趋势 / 复盘 / 给${nextPeriod}的建议"这四样自然融进你的话里——不是切成四段，是织在叙述里
+- 严格只用上面的素材，禁止编造没发生的事或没提过的计划
+- 给${nextPeriod}的建议必须从这${naturalPeriod}真实发生的事推出来：比如这${naturalPeriod}日记提到连续熬夜→建议早点睡；这${naturalPeriod}戒咖啡头疼→看戒断缓解没。不能凭空规划没依据的事
+- 谈趋势必须有数据支撑（例如"睡眠比${lastPeriod}少 40 分钟"）。两段健康数据有一段为空或差异不显著时，不要硬编趋势词
 - 结尾不用刻意展望${nextPeriod}，想到什么说什么，停在哪都行
 
 直接给出正文。`;
@@ -5545,14 +5568,30 @@ async function generateWeekly(env) {
 const todayStr = cnNow().toISOString().slice(0, 10);
 const startStr = isoDateAddDays(todayStr, -6); // 过去 7 天（含今天）
 const endStr = todayStr;
+// 上周（用于对比数据）：再往前 7 天
+const prevStartStr = isoDateAddDays(startStr, -7);
+const prevEndStr = isoDateAddDays(startStr, -1);
 
 const material = await buildSourceMaterial(env, startStr, endStr);
 if (material.diaries.length === 0 && material.moments.length === 0) {
 return { skipped: true, reason: "no-source", range: [startStr, endStr] };
 }
 
+const prevHealthRecords = await fetchHealthRecords(env, prevStartStr, prevEndStr);
+const prevHealthSummary = summarizeHealthForReview(prevHealthRecords);
 const formatted = formatMaterial(material);
-const prompt = buildReviewPrompt("本周", "一周", startStr, endStr, formatted, "200-400");
+const weekN = isoWeekOfYear(endStr);
+const yearOfWeek = new Date(endStr + "T00:00:00Z").getUTCFullYear();
+const prompt = buildReviewPrompt({
+periodLabel: "本周",
+naturalPeriod: "一周",
+startDate: startStr,
+endDate: endStr,
+periodTag: `${yearOfWeek} 年第 ${weekN} 周`,
+formatted,
+prevHealthSummary,
+wordRange: "400-700"
+});
 
 let content;
 try {
@@ -5562,19 +5601,20 @@ return { skipped: true, reason: "llm-failed", error: String(e?.message || e), ra
 }
 
 const id = generateId();
+const title = `上周 ${shortMD(startStr)}-${shortMD(endStr)}（第${weekN}周）`;
 const entry = {
 id, type: "diary",
 content,
 author: "weekly",
 author_label: "",
-title: `周记 · ${endStr}`,
+title,
 diary_date: endStr,
 locked: false,
 created_at: now(),
 updated_at: now()
 };
 await kvPut(env, `diary:${id}`, entry);
-return { ok: true, id, range: [startStr, endStr], materialCount: { diaries: material.diaries.length, moments: material.moments.length, health: material.healthRecords.length } };
+return { ok: true, id, title, range: [startStr, endStr], prevRange: [prevStartStr, prevEndStr], materialCount: { diaries: material.diaries.length, moments: material.moments.length, health: material.healthRecords.length, prevHealth: prevHealthRecords.length } };
 }
 
 async function generateMonthly(env) {
@@ -5583,14 +5623,31 @@ const yyyy = today.getUTCFullYear();
 const mm = today.getUTCMonth();
 const startStr = `${yyyy}-${String(mm + 1).padStart(2, "0")}-01`;
 const endStr = today.toISOString().slice(0, 10);
+// 上月日期范围（用于对比）
+const prevMonthLastDay = new Date(Date.UTC(yyyy, mm, 0));
+const prevYY = prevMonthLastDay.getUTCFullYear();
+const prevMM = prevMonthLastDay.getUTCMonth();
+const prevStartStr = `${prevYY}-${String(prevMM + 1).padStart(2, "0")}-01`;
+const prevEndStr = prevMonthLastDay.toISOString().slice(0, 10);
 
 const material = await buildSourceMaterial(env, startStr, endStr);
 if (material.diaries.length === 0 && material.moments.length === 0) {
 return { skipped: true, reason: "no-source", range: [startStr, endStr] };
 }
 
+const prevHealthRecords = await fetchHealthRecords(env, prevStartStr, prevEndStr);
+const prevHealthSummary = summarizeHealthForReview(prevHealthRecords);
 const formatted = formatMaterial(material);
-const prompt = buildReviewPrompt("本月", "一个月", startStr, endStr, formatted, "400-800");
+const prompt = buildReviewPrompt({
+periodLabel: "本月",
+naturalPeriod: "一个月",
+startDate: startStr,
+endDate: endStr,
+periodTag: `${yyyy} 年 ${mm + 1} 月`,
+formatted,
+prevHealthSummary,
+wordRange: "800-1500"
+});
 
 let content;
 try {
@@ -5599,21 +5656,21 @@ content = await callAnthropic(env, prompt, 3000);
 return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
 }
 
-const monthLabel = `${yyyy}-${String(mm + 1).padStart(2, "0")}`;
 const id = generateId();
+const title = `${yyyy}年${mm + 1}月 · 月记`;
 const entry = {
 id, type: "diary",
 content,
 author: "monthly",
 author_label: "",
-title: `月记 · ${monthLabel}`,
+title,
 diary_date: endStr,
 locked: false,
 created_at: now(),
 updated_at: now()
 };
 await kvPut(env, `diary:${id}`, entry);
-return { ok: true, id, range: [startStr, endStr], materialCount: { diaries: material.diaries.length, moments: material.moments.length, health: material.healthRecords.length } };
+return { ok: true, id, title, range: [startStr, endStr], prevRange: [prevStartStr, prevEndStr], materialCount: { diaries: material.diaries.length, moments: material.moments.length, health: material.healthRecords.length, prevHealth: prevHealthRecords.length } };
 }
 
 export default {
