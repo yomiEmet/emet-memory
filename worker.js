@@ -5504,15 +5504,13 @@ return kb.localeCompare(ka); // desc
 return all.slice(0, limit);
 }
 
-// 把之前的周记 / 月记格式化成 prompt 里的"前情提要"段落（每篇截 1000 字防膨胀）
+// 把之前的周记 / 月记格式化成 prompt 里的"前情提要"段落（不截断，完整原文）
 function formatPriorReviews(items) {
 if (!items || items.length === 0) return "";
 return items.map(item => {
 const kindLabel = item.author === "weekly" ? "周记" : item.author === "monthly" ? "月记" : "回顾";
 const title = item.title || `${kindLabel} · ${item.diary_date || ""}`;
-const content = item.content || "";
-const excerpt = content.length > 1000 ? content.slice(0, 1000) + "..." : content;
-return `[${title}]\n${excerpt}`;
+return `[${title}]\n${item.content || ""}`;
 }).join("\n\n---\n\n");
 }
 
@@ -5594,9 +5592,10 @@ ${priorSection}
 直接给出正文。`;
 }
 
-async function generateWeekly(env) {
-const todayStr = cnNow().toISOString().slice(0, 10);
-const startStr = isoDateAddDays(todayStr, -6); // 过去 7 天（含今天）
+async function generateWeekly(env, endOverride) {
+// endOverride 可选：用于手动回填往周（管理员路由 ?end=YYYY-MM-DD）
+const todayStr = endOverride || cnNow().toISOString().slice(0, 10);
+const startStr = isoDateAddDays(todayStr, -6); // 过去 7 天（含 endStr）
 const endStr = todayStr;
 // 上周（用于对比数据）：再往前 7 天
 const prevStartStr = isoDateAddDays(startStr, -7);
@@ -5652,12 +5651,13 @@ await kvPut(env, `diary:${id}`, entry);
 return { ok: true, id, title, range: [startStr, endStr], prevRange: [prevStartStr, prevEndStr], materialCount: { diaries: material.diaries.length, moments: material.moments.length, health: material.healthRecords.length, prevHealth: prevHealthRecords.length } };
 }
 
-async function generateMonthly(env) {
-const today = cnNow();
-const yyyy = today.getUTCFullYear();
-const mm = today.getUTCMonth();
+async function generateMonthly(env, endOverride) {
+// endOverride 可选：用于手动回填往月（管理员路由 ?end=YYYY-MM-DD，取该月）
+const anchorDate = endOverride ? new Date(endOverride + "T00:00:00Z") : cnNow();
+const yyyy = anchorDate.getUTCFullYear();
+const mm = anchorDate.getUTCMonth();
 const startStr = `${yyyy}-${String(mm + 1).padStart(2, "0")}-01`;
-const endStr = today.toISOString().slice(0, 10);
+const endStr = endOverride || cnNow().toISOString().slice(0, 10);
 // 上月日期范围（用于对比）
 const prevMonthLastDay = new Date(Date.UTC(yyyy, mm, 0));
 const prevYY = prevMonthLastDay.getUTCFullYear();
@@ -6412,11 +6412,13 @@ if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 
 if (path === "/api/events") return handleEvents(request, env);
 return handleConfig(request, env);
 }
-// ── 阶段 3 admin：手动触发周记 / 月记生成（测试 + 将来手动补写）──
+// ── 阶段 3 admin：手动触发周记 / 月记生成（测试 + 手动补写）──
+// 支持 ?end=YYYY-MM-DD 回填指定周/月
 if (path.startsWith("/api/admin/")) {
 if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
-if (path === "/api/admin/trigger-weekly") return jsonResponse(await generateWeekly(env));
-if (path === "/api/admin/trigger-monthly") return jsonResponse(await generateMonthly(env));
+const endParam = url.searchParams.get("end") || undefined;
+if (path === "/api/admin/trigger-weekly") return jsonResponse(await generateWeekly(env, endParam));
+if (path === "/api/admin/trigger-monthly") return jsonResponse(await generateMonthly(env, endParam));
 return jsonResponse({ error: "Not found" }, 404);
 }
 // ── 统一鉴权闸门：/api/* 全部要求 X-Admin-Key ──
