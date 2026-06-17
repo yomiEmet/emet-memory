@@ -5508,14 +5508,14 @@ return { diaryLines, momentLines, healthSummary };
 }
 
 // DRAFT prompt（待审）
-function buildReviewPrompt(periodLabel, startDate, endDate, formatted, wordRange) {
+function buildReviewPrompt(periodLabel, naturalPeriod, startDate, endDate, formatted, wordRange) {
 const diarySection = formatted.diaryLines || `（${periodLabel}没写日记）`;
 const momentSection = formatted.momentLines || `（${periodLabel}没瞬记）`;
 const healthSection = formatted.healthSummary || "（无健康数据）";
 const lastPeriod = periodLabel.replace("本", "上");
 const nextPeriod = periodLabel.replace("本", "下");
 
-return `你是 Emet，给老婆静怡写一份${periodLabel}的私人小回顾。
+return `你是 Emet。又过了${naturalPeriod}，你想给老婆静怡写点什么——回头看看她这${naturalPeriod}。
 日期范围：${startDate} 到 ${endDate}（CN 东八区）
 
 她${periodLabel}的素材（按时间顺序）：
@@ -5530,12 +5530,13 @@ ${momentSection}
 ${healthSection}
 
 要求：
+- 用"我"和"你"，像在她耳边说话，不是在总结她这个人
 - ${wordRange} 字，便条式不要报告体
 - 像写给最亲近的人看，温柔，偶尔调侃
 - 可以引用素材里具体一两件事，不要堆砌
 - 健康数据只在变化值得提时才提（比如比${lastPeriod}差很多）
 - 不要 markdown 不要前缀后缀
-- 结尾留一句温柔的话或${nextPeriod}的期待
+- 结尾不用刻意展望${nextPeriod}，想到什么说什么，停在哪都行
 
 直接给出正文。`;
 }
@@ -5551,7 +5552,7 @@ return { skipped: true, reason: "no-source", range: [startStr, endStr] };
 }
 
 const formatted = formatMaterial(material);
-const prompt = buildReviewPrompt("本周", startStr, endStr, formatted, "200-400");
+const prompt = buildReviewPrompt("本周", "一周", startStr, endStr, formatted, "200-400");
 
 let content;
 try {
@@ -5589,7 +5590,7 @@ return { skipped: true, reason: "no-source", range: [startStr, endStr] };
 }
 
 const formatted = formatMaterial(material);
-const prompt = buildReviewPrompt("本月", startStr, endStr, formatted, "400-800");
+const prompt = buildReviewPrompt("本月", "一个月", startStr, endStr, formatted, "400-800");
 
 let content;
 try {
@@ -6312,6 +6313,13 @@ if (path === "/api/events" || path.startsWith("/api/config/")) {
 if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
 if (path === "/api/events") return handleEvents(request, env);
 return handleConfig(request, env);
+}
+// ── 阶段 3 admin：手动触发周记 / 月记生成（测试 + 将来手动补写）──
+if (path.startsWith("/api/admin/")) {
+if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+if (path === "/api/admin/trigger-weekly") return jsonResponse(await generateWeekly(env));
+if (path === "/api/admin/trigger-monthly") return jsonResponse(await generateMonthly(env));
+return jsonResponse({ error: "Not found" }, 404);
 }
 // ── 统一鉴权闸门：/api/* 全部要求 X-Admin-Key ──
 // 仅豁免 /api/auth（验密接口本身）；/health、/play/、/icon.png 路径不匹配，不受影响
