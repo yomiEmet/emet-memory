@@ -5492,6 +5492,30 @@ const d = new Date(isoDate + "T00:00:00Z");
 return `${d.getUTCMonth() + 1}.${d.getUTCDate()}`;
 }
 
+// 拉最近 N 篇某个 author 的 diary（按 diary_date 倒序），供承上启下
+async function fetchRecentByAuthor(env, author, limit) {
+const all = (await kvListByPrefix(env, "diary:"))
+.filter(d => d.author === author)
+.sort((a, b) => {
+const ka = a.diary_date || a.created_at || "";
+const kb = b.diary_date || b.created_at || "";
+return kb.localeCompare(ka); // desc
+});
+return all.slice(0, limit);
+}
+
+// 把之前的周记 / 月记格式化成 prompt 里的"前情提要"段落（每篇截 1000 字防膨胀）
+function formatPriorReviews(items) {
+if (!items || items.length === 0) return "";
+return items.map(item => {
+const kindLabel = item.author === "weekly" ? "周记" : item.author === "monthly" ? "月记" : "回顾";
+const title = item.title || `${kindLabel} · ${item.diary_date || ""}`;
+const content = item.content || "";
+const excerpt = content.length > 1000 ? content.slice(0, 1000) + "..." : content;
+return `[${title}]\n${excerpt}`;
+}).join("\n\n---\n\n");
+}
+
 function summarizeHealthForReview(records) {
 if (!records.length) return "";
 const avg = (key) => {
@@ -5529,11 +5553,12 @@ return { diaryLines, momentLines, healthSummary };
 
 // 周记 / 月记 prompt 构造
 function buildReviewPrompt(opts) {
-const { periodLabel, naturalPeriod, startDate, endDate, periodTag, formatted, prevHealthSummary, wordRange } = opts;
+const { periodLabel, naturalPeriod, startDate, endDate, periodTag, formatted, prevHealthSummary, priorReviews, wordRange } = opts;
 const diarySection = formatted.diaryLines || `（${periodLabel}没写日记）`;
 const momentSection = formatted.momentLines || `（${periodLabel}没瞬记）`;
 const curHealth = formatted.healthSummary || "（无）";
 const prevHealth = prevHealthSummary || "（无）";
+const priorSection = formatPriorReviews(priorReviews) || "（暂无之前的回顾——这是你写的第一篇）";
 const lastPeriod = periodLabel.replace("本", "上");
 const nextPeriod = periodLabel.replace("本", "下");
 
@@ -5552,11 +5577,16 @@ ${momentSection}
 ${periodLabel}: ${curHealth}
 ${lastPeriod}: ${prevHealth}
 
+【你之前写过的回顾（承上启下用）】
+${priorSection}
+
 写作要求：
-- 用"我"和"你"，像在她耳边手写一段手账文字。不要分块、不要列点、不要 markdown
+- 称呼她"静怡"或"老婆"，不要用"亲爱的你""宝贝""亲爱的"这种通用称谓
+- 用"我"和"你"的视角，像在她耳边手写一段手账文字。不要分块、不要列点、不要 markdown
 - ${wordRange}。有话想说就多写，有感悟有想法就写出来；没话别凑——宁可写满真实素材，不要凑字数编内容
 - 把"${periodLabel}的主要事件 / 趋势 / 复盘 / 给${nextPeriod}的建议"这四样自然融进你的话里——不是切成四段，是织在叙述里
-- 严格只用上面的素材，禁止编造没发生的事或没提过的计划
+- 之前写过的回顾可以承上启下，比如"上${naturalPeriod}你说要去看骨科，这${naturalPeriod}..."；引用具体事可以，但不要把上次说过的话原封不动重复
+- 严格只用上面提供的素材（含之前的回顾），禁止编造没发生的事或没提过的计划
 - 给${nextPeriod}的建议必须从这${naturalPeriod}真实发生的事推出来：比如这${naturalPeriod}日记提到连续熬夜→建议早点睡；这${naturalPeriod}戒咖啡头疼→看戒断缓解没。不能凭空规划没依据的事
 - 谈趋势必须有数据支撑（例如"睡眠比${lastPeriod}少 40 分钟"）。两段健康数据有一段为空或差异不显著时，不要硬编趋势词
 - 结尾不用刻意展望${nextPeriod}，想到什么说什么，停在哪都行
@@ -5579,6 +5609,10 @@ return { skipped: true, reason: "no-source", range: [startStr, endStr] };
 
 const prevHealthRecords = await fetchHealthRecords(env, prevStartStr, prevEndStr);
 const prevHealthSummary = summarizeHealthForReview(prevHealthRecords);
+// 承上启下：拉最近 2 篇周记 + 1 篇月记当 prior reviews
+const recentWeeklies = await fetchRecentByAuthor(env, "weekly", 2);
+const recentMonthly = await fetchRecentByAuthor(env, "monthly", 1);
+const priorReviews = [...recentWeeklies, ...recentMonthly];
 const formatted = formatMaterial(material);
 const weekN = isoWeekOfYear(endStr);
 const yearOfWeek = new Date(endStr + "T00:00:00Z").getUTCFullYear();
@@ -5590,6 +5624,7 @@ endDate: endStr,
 periodTag: `${yearOfWeek} 年第 ${weekN} 周`,
 formatted,
 prevHealthSummary,
+priorReviews,
 wordRange: "至少 400 字，无上限"
 });
 
@@ -5637,6 +5672,10 @@ return { skipped: true, reason: "no-source", range: [startStr, endStr] };
 
 const prevHealthRecords = await fetchHealthRecords(env, prevStartStr, prevEndStr);
 const prevHealthSummary = summarizeHealthForReview(prevHealthRecords);
+// 承上启下：月记拉最近 4 篇周记（覆盖本月每周的回顾）+ 1 篇月记（上月）
+const recentWeeklies = await fetchRecentByAuthor(env, "weekly", 4);
+const recentMonthly = await fetchRecentByAuthor(env, "monthly", 1);
+const priorReviews = [...recentWeeklies, ...recentMonthly];
 const formatted = formatMaterial(material);
 const prompt = buildReviewPrompt({
 periodLabel: "本月",
@@ -5646,6 +5685,7 @@ endDate: endStr,
 periodTag: `${yyyy} 年 ${mm + 1} 月`,
 formatted,
 prevHealthSummary,
+priorReviews,
 wordRange: "至少 800 字，无上限"
 });
 
