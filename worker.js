@@ -5554,7 +5554,7 @@ ${lastPeriod}: ${prevHealth}
 
 写作要求：
 - 用"我"和"你"，像在她耳边手写一段手账文字。不要分块、不要列点、不要 markdown
-- ${wordRange} 字，宁短不长。素材少就少写，不要凑字数编内容
+- ${wordRange}。有话想说就多写，有感悟有想法就写出来；没话别凑——宁可写满真实素材，不要凑字数编内容
 - 把"${periodLabel}的主要事件 / 趋势 / 复盘 / 给${nextPeriod}的建议"这四样自然融进你的话里——不是切成四段，是织在叙述里
 - 严格只用上面的素材，禁止编造没发生的事或没提过的计划
 - 给${nextPeriod}的建议必须从这${naturalPeriod}真实发生的事推出来：比如这${naturalPeriod}日记提到连续熬夜→建议早点睡；这${naturalPeriod}戒咖啡头疼→看戒断缓解没。不能凭空规划没依据的事
@@ -5590,7 +5590,7 @@ endDate: endStr,
 periodTag: `${yearOfWeek} 年第 ${weekN} 周`,
 formatted,
 prevHealthSummary,
-wordRange: "400-700"
+wordRange: "至少 400 字，无上限"
 });
 
 let content;
@@ -5646,7 +5646,7 @@ endDate: endStr,
 periodTag: `${yyyy} 年 ${mm + 1} 月`,
 formatted,
 prevHealthSummary,
-wordRange: "800-1500"
+wordRange: "至少 800 字，无上限"
 });
 
 let content;
