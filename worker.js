@@ -5556,7 +5556,7 @@ const prompt = buildReviewPrompt("本周", "一周", startStr, endStr, formatted
 
 let content;
 try {
-content = await callAnthropic(env, prompt);
+content = await callAnthropic(env, prompt, 600);
 } catch (e) {
 return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
 }
@@ -5594,7 +5594,7 @@ const prompt = buildReviewPrompt("本月", "一个月", startStr, endStr, format
 
 let content;
 try {
-content = await callAnthropic(env, prompt);
+content = await callAnthropic(env, prompt, 1500);
 } catch (e) {
 return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
 }
@@ -5966,7 +5966,8 @@ model: "claude-haiku-4-5-20251001",
 }
 
 // Anthropic-compatible Messages API（endpoint + model 可在 KV config:llm 覆盖）
-async function callAnthropic(env, prompt) {
+// maxTokens 默认 200（够 night-guard 30 字催睡用）；周记 / 月记调用时显式传更大
+async function callAnthropic(env, prompt, maxTokens = 200) {
 if (!env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
 const cfg = (await kvGet(env, "config:llm")) || defaultLlmConfig();
 const resp = await fetch(cfg.endpoint, {
@@ -5978,7 +5979,7 @@ headers: {
 },
 body: JSON.stringify({
 model: cfg.model,
-max_tokens: 200,
+max_tokens: maxTokens,
 messages: [{ role: "user", content: prompt }],
 }),
 });
