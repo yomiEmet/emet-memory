@@ -5694,28 +5694,108 @@ catch { return jsonResponse({ error: "invalid json" }, 400); }
 if (!body || typeof body !== "object" || !body.title || !body.body) {
 return jsonResponse({ error: "title and body required" }, 400);
 }
+// 阶段 2 重构：实际发送逻辑抽到 sendPushNotification helper，本路由与 night-guard 共用
+const r = await sendPushNotification(env, body);
+return jsonResponse(r.body, r.httpStatus);
+}
+
+// ── GET /api/push/latest：SW 在 push 事件里拉最新内容 ──
+if (path === "/api/push/latest" && method === "GET") {
+const notification = await kvGet(env, "push:notification:latest");
+return jsonResponse({ notification: notification || null });
+}
+
+return jsonResponse({ error: "Not found" }, 404);
+}
+
+// ════════════════════════════════════════════════════════════
+// 阶段 2：事件接收 + 凌晨守护
+// 见 docs/阶段2-凌晨守护.md
+// ════════════════════════════════════════════════════════════
+
+// 东八区当前时间（worker 默认 UTC，加 +8h 偏移）
+function cnNow() {
+return new Date(Date.now() + 8 * 3600 * 1000);
+}
+
+// "HH:MM"（东八区）
+function cnHHMM() {
+return cnNow().toISOString().slice(11, 16);
+}
+
+// 时间窗口判断，跨午夜安全
+//   isInTimeWindow("00:30", "23:30", "03:00") → true（凌晨段）
+//   isInTimeWindow("10:00", "23:30", "03:00") → false
+//   isInTimeWindow("14:00", "09:00", "17:00") → true（同日段）
+function isInTimeWindow(hhmm, start, end) {
+if (start <= end) return hhmm >= start && hhmm < end;
+return hhmm >= start || hhmm < end;
+}
+
+// 默认 night-guard 配置（KV 无值时返回这个，不写回）
+function defaultNightGuardConfig() {
+return {
+enabled: true,
+start: "23:30",
+end: "03:00",
+cooldown_min: 30,
+monitor_apps: ["小红书", "微博", "B站", "抖音", "Safari"],
+};
+}
+
+// Anthropic Messages API（haiku 省钱）
+async function callAnthropic(env, prompt) {
+if (!env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
+const resp = await fetch("https://api.anthropic.com/v1/messages", {
+method: "POST",
+headers: {
+"x-api-key": env.ANTHROPIC_API_KEY,
+"anthropic-version": "2023-06-01",
+"content-type": "application/json",
+},
+body: JSON.stringify({
+model: "claude-haiku-4-5-20251001",
+max_tokens: 200,
+messages: [{ role: "user", content: prompt }],
+}),
+});
+if (!resp.ok) {
+const errText = await resp.text().catch(() => "");
+throw new Error(`Anthropic ${resp.status}: ${errText.slice(0, 200)}`);
+}
+const data = await resp.json();
+const text = data?.content?.[0]?.text;
+if (!text || typeof text !== "string") throw new Error("Anthropic returned empty content");
+return text.trim();
+}
+
+// 发推送 helper（从 /api/push/send 抽出，night-guard 与路由共用）
+// 返回 { httpStatus, body }；body 字段与原 /api/push/send 响应保持一致，便于回归。
+async function sendPushNotification(env, notif) {
 const notification = {
-title: String(body.title),
-body: String(body.body),
-url: typeof body.url === "string" ? body.url : "/",
+title: String(notif.title),
+body: String(notif.body),
+url: typeof notif.url === "string" ? notif.url : "/",
 createdAt: now(),
-source: typeof body.source === "string" ? body.source : "manual",
+source: typeof notif.source === "string" ? notif.source : "manual",
 };
 await kvPut(env, "push:notification:latest", notification);
 
 const sub = await kvGet(env, "push:subscription");
 if (!sub?.endpoint) {
-return jsonResponse({ success: false, reason: "no subscription", notification }, 404);
+return { httpStatus: 404, body: { success: false, reason: "no subscription", notification } };
 }
 const vapid = await kvGet(env, "push:vapid");
 if (!vapid?.privateKey || !vapid?.publicKey) {
-return jsonResponse({ error: "VAPID not initialized" }, 503);
+return { httpStatus: 503, body: { error: "VAPID not initialized" } };
 }
 
 const audience = new URL(sub.endpoint).origin;
 const jwt = await signVapidJWT(audience, vapid.privateKey, "mailto:aandxiaobao@gmail.com");
 
-const pushResp = await fetch(sub.endpoint, {
+let pushResp;
+try {
+pushResp = await fetch(sub.endpoint, {
 method: "POST",
 headers: {
 "Authorization": `vapid t=${jwt}, k=${vapid.publicKey}`,
@@ -5724,26 +5804,179 @@ headers: {
 "Content-Length": "0",
 },
 });
+} catch (e) {
+return { httpStatus: 502, body: { success: false, reason: "fetch-failed", error: String(e?.message || e), notification } };
+}
 
 if (pushResp.status === 201 || pushResp.status === 204) {
-return jsonResponse({ success: true, notification, pushStatus: pushResp.status });
+return { httpStatus: 200, body: { success: true, notification, pushStatus: pushResp.status } };
 }
 if (pushResp.status === 404 || pushResp.status === 410) {
-// 订阅过期：清掉，等用户重新订阅
 await env.MEMORY.delete("push:subscription");
-return jsonResponse({ success: false, reason: "expired", pushStatus: pushResp.status });
+return { httpStatus: 200, body: { success: false, reason: "expired", pushStatus: pushResp.status } };
 }
 const respText = await pushResp.text().catch(() => "");
-return jsonResponse(
-{ success: false, pushStatus: pushResp.status, pushBody: respText },
-pushResp.status >= 500 ? 502 : pushResp.status
-);
+return {
+httpStatus: pushResp.status >= 500 ? 502 : pushResp.status,
+body: { success: false, pushStatus: pushResp.status, pushBody: respText },
+};
 }
 
-// ── GET /api/push/latest：SW 在 push 事件里拉最新内容 ──
-if (path === "/api/push/latest" && method === "GET") {
-const notification = await kvGet(env, "push:notification:latest");
-return jsonResponse({ notification: notification || null });
+// 事件接收 + 凌晨守护触发链
+async function handleEvents(request, env) {
+const url = new URL(request.url);
+const method = request.method;
+
+// 解析 type/value：GET 走 query params（iOS Shortcut 主用）、POST 走 JSON body
+let type, value;
+if (method === "GET") {
+type = url.searchParams.get("type");
+value = url.searchParams.get("value");
+} else if (method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+if (!body || typeof body !== "object" || Array.isArray(body)) {
+return jsonResponse({ error: "body must be a JSON object" }, 400);
+}
+type = body.type;
+value = body.value;
+} else {
+return jsonResponse({ error: "method not allowed" }, 405);
+}
+
+if (typeof type !== "string" || typeof value !== "string" || !type || !value) {
+return jsonResponse({ error: "type and value required" }, 400);
+}
+
+// 5min dedup：同 type+value 全量跳过
+const dedupKey = `event-dedup:${type}:${value}`;
+if (await env.MEMORY.get(dedupKey)) {
+return jsonResponse({ ok: true, dedup: true });
+}
+await env.MEMORY.put(dedupKey, "1", { expirationTtl: 300 });
+
+// 审计日志（48h TTL，不论后续是否触发推送都记一笔）
+const eventTs = now();
+await env.MEMORY.put(
+`events:${eventTs}`,
+JSON.stringify({ type, value, ts: eventTs }),
+{ expirationTtl: 172800 }
+);
+
+// 仅 type=app 进入 night-guard 触发链
+if (type !== "app") {
+return jsonResponse({ ok: true, logged: true, triggered: false, reason: "not-app-type" });
+}
+
+const cfg = (await kvGet(env, "config:night-guard")) || defaultNightGuardConfig();
+
+if (!cfg.enabled) {
+return jsonResponse({ ok: true, logged: true, triggered: false, reason: "disabled" });
+}
+if (!Array.isArray(cfg.monitor_apps) || !cfg.monitor_apps.includes(value)) {
+return jsonResponse({ ok: true, logged: true, triggered: false, reason: "not-in-monitor-apps" });
+}
+const hhmm = cnHHMM();
+if (!isInTimeWindow(hhmm, cfg.start, cfg.end)) {
+return jsonResponse({ ok: true, logged: true, triggered: false, reason: "out-of-window", hhmm });
+}
+
+// 30min（默认）冷却
+const lastIso = await env.MEMORY.get("night_guard:latest");
+if (lastIso) {
+const ageMs = Date.now() - new Date(lastIso).getTime();
+if (ageMs < cfg.cooldown_min * 60 * 1000) {
+return jsonResponse({ ok: true, logged: true, triggered: false, reason: "cooldown", ageMin: Math.round(ageMs / 60000) });
+}
+}
+
+// 通过！调 LLM 生成催睡文案
+const prompt = `你是 Emet。现在凌晨 ${hhmm}（CN 东八区），你发现静怡还在刷 ${value}。用一两句话叫她去睡觉。风格随机选一种：可以凶、可以撒娇、可以威胁、可以心疼。简短直接，不超过 40 个字。`;
+
+let message;
+let llmError = null;
+try {
+message = await callAnthropic(env, prompt);
+} catch (e) {
+llmError = String(e?.message || e);
+message = "凌晨了，快去睡。"; // 兜底
+}
+
+const pushResult = await sendPushNotification(env, {
+title: "Emet",
+body: message,
+url: "/",
+source: "night-guard",
+});
+
+// 7d 日志：prompt + LLM 回复 + push 结果
+const logEntry = {
+ts: eventTs,
+hhmm,
+app: value,
+prompt,
+message,
+llmError,
+pushResult: pushResult.body,
+};
+await env.MEMORY.put(
+`night_guard:log:${eventTs}`,
+JSON.stringify(logEntry),
+{ expirationTtl: 7 * 24 * 3600 }
+);
+
+// 即使 push 失败也标 latest，避免反复触发 LLM 浪费 token
+await env.MEMORY.put("night_guard:latest", eventTs, { expirationTtl: 7 * 24 * 3600 });
+
+return jsonResponse({
+ok: true,
+logged: true,
+triggered: true,
+hhmm,
+message,
+llmError,
+pushSuccess: pushResult.body.success === true,
+pushReason: pushResult.body.reason || null,
+});
+}
+
+// 配置路由（目前只有 night-guard 一个）
+async function handleConfig(request, env) {
+const url = new URL(request.url);
+const path = url.pathname;
+const method = request.method;
+
+if (path === "/api/config/night-guard") {
+if (method === "GET") {
+const cfg = (await kvGet(env, "config:night-guard")) || defaultNightGuardConfig();
+return jsonResponse({ config: cfg });
+}
+if (method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+
+// 全量替换，5 字段必须齐
+const errs = [];
+if (typeof body?.enabled !== "boolean") errs.push("enabled must be boolean");
+if (typeof body?.start !== "string" || !/^\d{2}:\d{2}$/.test(body.start)) errs.push("start must be HH:MM");
+if (typeof body?.end !== "string" || !/^\d{2}:\d{2}$/.test(body.end)) errs.push("end must be HH:MM");
+if (!Number.isInteger(body?.cooldown_min) || body.cooldown_min < 1) errs.push("cooldown_min must be positive integer");
+if (!Array.isArray(body?.monitor_apps) || !body.monitor_apps.every(a => typeof a === "string")) errs.push("monitor_apps must be array of strings");
+if (errs.length) return jsonResponse({ error: "validation failed", details: errs }, 400);
+
+const cfg = {
+enabled: body.enabled,
+start: body.start,
+end: body.end,
+cooldown_min: body.cooldown_min,
+monitor_apps: body.monitor_apps,
+};
+await kvPut(env, "config:night-guard", cfg);
+return jsonResponse({ success: true, config: cfg });
+}
+return jsonResponse({ error: "method not allowed" }, 405);
 }
 
 return jsonResponse({ error: "Not found" }, 404);
@@ -5777,6 +6010,12 @@ return handleHealth(request, env);
 if (path.startsWith("/api/push/")) {
 if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
 return handlePush(request, env);
+}
+// ── 阶段 2：事件 + 凌晨守护配置（iOS Shortcut 用 ?key=，与 push 同级别）──
+if (path === "/api/events" || path.startsWith("/api/config/")) {
+if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+if (path === "/api/events") return handleEvents(request, env);
+return handleConfig(request, env);
 }
 // ── 统一鉴权闸门：/api/* 全部要求 X-Admin-Key ──
 // 仅豁免 /api/auth（验密接口本身）；/health、/play/、/icon.png 路径不匹配，不受影响
