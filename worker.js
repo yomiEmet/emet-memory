@@ -5595,7 +5595,7 @@ wordRange: "至少 400 字，无上限"
 
 let content;
 try {
-content = await callAnthropic(env, prompt, 1500);
+content = await callAnthropic(env, prompt, 4000);
 } catch (e) {
 return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
 }
@@ -5651,7 +5651,7 @@ wordRange: "至少 800 字，无上限"
 
 let content;
 try {
-content = await callAnthropic(env, prompt, 3000);
+content = await callAnthropic(env, prompt, 8000);
 } catch (e) {
 return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
 }
