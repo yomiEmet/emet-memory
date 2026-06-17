@@ -5556,7 +5556,7 @@ const prompt = buildReviewPrompt("本周", "一周", startStr, endStr, formatted
 
 let content;
 try {
-content = await callAnthropic(env, prompt, 600);
+content = await callAnthropic(env, prompt, 1500);
 } catch (e) {
 return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
 }
@@ -5594,7 +5594,7 @@ const prompt = buildReviewPrompt("本月", "一个月", startStr, endStr, format
 
 let content;
 try {
-content = await callAnthropic(env, prompt, 1500);
+content = await callAnthropic(env, prompt, 3000);
 } catch (e) {
 return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
 }
