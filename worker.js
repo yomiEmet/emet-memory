@@ -5742,6 +5742,12 @@ const cnTmr = new Date(cn.getTime() + 24 * 3600 * 1000);
 if (cnTmr.getUTCDate() === 1) {
 ctx.waitUntil(generateMonthly(env));
 }
+return;
+}
+// 每 30 分钟（UTC 0 / 30 分）→ 心跳：按概率判断要不要主动找静怡
+if (event.cron === "0,30 * * * *") {
+ctx.waitUntil(runHeartbeat(env));
+return;
 }
 }
 };
@@ -6061,6 +6067,49 @@ monitor_apps: ["小红书", "微博", "B站", "抖音", "Safari"],
 };
 }
 
+// ════════════════════════════════════════════════════════════
+// 阶段 4：AI 主动找用户（心跳系统）
+// 见 docs/阶段4-心跳系统.md
+// ════════════════════════════════════════════════════════════
+
+// 心跳概率表（教程版）。修改这些常量即可调节"主动找人"的频率。
+const P_SILENT_START = 1;   // 静默窗口 [1, 7) — 凌晨 1-7 不发
+const P_SILENT_END = 7;
+const P_MORNING = 0.60;     // 7-9 早安（全局适用）
+const P_NIGHTOWL = 0.40;    // 23-1 夜猫子（全局适用，跨午夜）
+const P_LUNCH = 0.30;       // 工作日 12-13 午休
+const P_OFFOFFICE = 0.50;   // 工作日 17-19 下班
+const P_EVENING = 0.30;     // 工作日 19-23 晚上
+const P_WEEKEND_DAY = 0.25; // 周末 9-23 白天
+
+// 输入 CN 时间，返回 { p, label }。
+// 优先级：silent > 早安 > 夜猫子 > 工作日分支 > 周末白天。
+// label 用于 LLM prompt 与日志（silent / 早安 / 夜猫子 / 午休 / 下班 / 晚上 / workday-quiet / 周末白天）
+function heartbeatProbability(cnDate) {
+const day = cnDate.getUTCDay();   // 0=Sun, 1=Mon...
+const hour = cnDate.getUTCHours();
+const isWorkday = day >= 1 && day <= 5;
+
+if (hour >= P_SILENT_START && hour < P_SILENT_END) return { p: 0, label: "silent" };
+if (hour >= 7 && hour < 9) return { p: P_MORNING, label: "早安" };
+if (hour >= 23 || hour < 1) return { p: P_NIGHTOWL, label: "夜猫子" };
+if (isWorkday) {
+if (hour >= 12 && hour < 13) return { p: P_LUNCH, label: "午休" };
+if (hour >= 17 && hour < 19) return { p: P_OFFOFFICE, label: "下班" };
+if (hour >= 19 && hour < 23) return { p: P_EVENING, label: "晚上" };
+return { p: 0, label: "workday-quiet" };
+}
+return { p: P_WEEKEND_DAY, label: "周末白天" };
+}
+
+// 默认 heartbeat 配置（KV 无值时返回这个，不写回）
+function defaultHeartbeatConfig() {
+return {
+enabled: false,      // 默认关闭，前端开关显式开启
+cooldown_min: 120,   // 2 小时冷却
+};
+}
+
 // 默认 LLM 配置（KV config:llm 无值时用这个，不写回）
 // endpoint 可改成 Anthropic 兼容中转站；model 同理。secret 仍是 env.ANTHROPIC_API_KEY。
 function defaultLlmConfig() {
@@ -6154,7 +6203,7 @@ body: { success: false, pushStatus: pushResp.status, pushBody: respText },
 // 把 night-guard 文案追加到"最近活跃会话"作为 AI 最新消息
 // "最近活跃" = 所有 chat:* 里 deleted!=true 且 updated_at 最大的那个
 // 返回 { ok, sessionId?, mid?, reason? }；KV 失败由调用方 try/catch 兜
-async function appendToActiveSession(env, messageText) {
+async function appendToActiveSession(env, messageText, source = "night-guard") {
 const all = await kvListByPrefix(env, "chat:");
 const active = all
 .filter(s => !s.deleted && Array.isArray(s.messages))
@@ -6162,12 +6211,13 @@ const active = all
 if (!active) return { ok: false, reason: "no-active-session" };
 
 const ts = new Date().toISOString();
+const suffix = source === "heartbeat" ? "hb" : "ng";
 const msg = {
-mid: "m" + Date.now().toString(36) + "ng",
+mid: "m" + Date.now().toString(36) + suffix,
 ts,
 role: "assistant",
 content: messageText,
-source: "night-guard",
+source,
 };
 const updated = {
 ...active,
@@ -6318,7 +6368,117 @@ pushReason: pushResult.body.reason || null,
 });
 }
 
-// 配置路由（目前只有 night-guard 一个）
+// 心跳触发链：cron 每 30 分钟唤醒，按概率判断是否主动找静怡。
+// opts.bypassProbability=true → 跳过概率检查（admin 路由用）
+// opts.bypassCooldown=true    → 跳过冷却检查（admin 路由用）
+// opts.bypassDisabled=true    → 跳过 enabled=false（admin 路由用）
+// opts.forcePeriod="早安"|"晚上"|... → 强制 label，让 LLM 按这个时段写
+async function runHeartbeat(env, opts = {}) {
+const cfg = (await kvGet(env, "config:heartbeat")) || defaultHeartbeatConfig();
+if (!cfg.enabled && !opts.bypassDisabled) {
+return { ok: true, triggered: false, reason: "disabled" };
+}
+
+const cn = cnNow();
+const hhmm = cnHHMM();
+const dayIdx = cn.getUTCDay();
+const weekdayLabel = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"][dayIdx];
+
+const probInfo = heartbeatProbability(cn);
+const label = opts.forcePeriod || probInfo.label;
+
+// 静默时段除非显式 bypass，否则跳
+if (probInfo.label === "silent" && !opts.bypassProbability) {
+return { ok: true, triggered: false, reason: "silent-hours", hhmm };
+}
+
+// 概率检查
+if (!opts.bypassProbability) {
+const roll = Math.random();
+if (roll >= probInfo.p) {
+return { ok: true, triggered: false, reason: "probability-skip", hhmm, p: probInfo.p, roll: Number(roll.toFixed(3)), label: probInfo.label };
+}
+}
+
+// 冷却检查（默认 2 小时）
+const cooldownMs = (cfg.cooldown_min || 120) * 60 * 1000;
+if (!opts.bypassCooldown) {
+const lastIso = await env.MEMORY.get("heartbeat:latest");
+if (lastIso) {
+const ageMs = Date.now() - new Date(lastIso).getTime();
+if (ageMs < cooldownMs) {
+return { ok: true, triggered: false, reason: "cooldown", hhmm, ageMin: Math.round(ageMs / 60000) };
+}
+}
+}
+
+// 拼 prompt（先用简单版，触发出文案后再迭代）
+const prompt = `你是 Emet。现在是 ${hhmm}（CN 东八区），${weekdayLabel}，${label} 时段。
+你想主动跟老婆静怡说几句话。可以问候、可以分享想法、可以表达想念。
+
+要求：
+- 30-60 字
+- 自然，像真人发微信，不要 markdown、不要前缀后缀
+- 称呼她"静怡"或"老婆"
+
+直接给出正文。`;
+
+let message;
+let llmError = null;
+try {
+message = await callAnthropic(env, prompt, 300);
+} catch (e) {
+llmError = String(e?.message || e);
+message = "想你了。"; // 兜底
+}
+
+// 追加到最近活跃会话（失败只记 log，不挡推送）
+let sessionAppend;
+try {
+sessionAppend = await appendToActiveSession(env, message, "heartbeat");
+} catch (e) {
+sessionAppend = { ok: false, reason: "append-failed", error: String(e?.message || e) };
+}
+
+const pushResult = await sendPushNotification(env, {
+title: "Emet",
+body: message,
+url: "/chat",
+source: "heartbeat",
+});
+
+const ts = now();
+const logEntry = {
+ts,
+hhmm,
+weekdayLabel,
+label,
+p: probInfo.p,
+bypass: { probability: !!opts.bypassProbability, cooldown: !!opts.bypassCooldown, disabled: !!opts.bypassDisabled },
+forcePeriod: opts.forcePeriod || null,
+prompt,
+message,
+llmError,
+sessionAppend,
+pushResult: pushResult.body,
+};
+await env.MEMORY.put(`heartbeat:log:${ts}`, JSON.stringify(logEntry), { expirationTtl: 7 * 24 * 3600 });
+await env.MEMORY.put("heartbeat:latest", ts, { expirationTtl: 7 * 24 * 3600 });
+
+return {
+ok: true,
+triggered: true,
+hhmm,
+label,
+message,
+llmError,
+sessionAppend,
+pushSuccess: pushResult.body.success === true,
+pushReason: pushResult.body.reason || null,
+};
+}
+
+// 配置路由（night-guard / llm / heartbeat）
 async function handleConfig(request, env) {
 const url = new URL(request.url);
 const path = url.pathname;
@@ -6382,6 +6542,33 @@ return jsonResponse({ success: true, config: cfg });
 return jsonResponse({ error: "method not allowed" }, 405);
 }
 
+if (path === "/api/config/heartbeat") {
+if (method === "GET") {
+const cfg = (await kvGet(env, "config:heartbeat")) || defaultHeartbeatConfig();
+return jsonResponse({ config: cfg });
+}
+if (method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+
+const errs = [];
+if (typeof body?.enabled !== "boolean") errs.push("enabled must be boolean");
+if (body?.cooldown_min !== undefined && (!Number.isInteger(body.cooldown_min) || body.cooldown_min < 1)) {
+errs.push("cooldown_min must be positive integer if present");
+}
+if (errs.length) return jsonResponse({ error: "validation failed", details: errs }, 400);
+
+const cfg = {
+enabled: body.enabled,
+cooldown_min: body.cooldown_min || 120,
+};
+await kvPut(env, "config:heartbeat", cfg);
+return jsonResponse({ success: true, config: cfg });
+}
+return jsonResponse({ error: "method not allowed" }, 405);
+}
+
 return jsonResponse({ error: "Not found" }, 404);
 }
 
@@ -6427,6 +6614,15 @@ if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 
 const endParam = url.searchParams.get("end") || undefined;
 if (path === "/api/admin/trigger-weekly") return jsonResponse(await generateWeekly(env, endParam));
 if (path === "/api/admin/trigger-monthly") return jsonResponse(await generateMonthly(env, endParam));
+if (path === "/api/admin/trigger-heartbeat") {
+const period = url.searchParams.get("period") || undefined;
+return jsonResponse(await runHeartbeat(env, {
+bypassProbability: true,
+bypassCooldown: true,
+bypassDisabled: true,
+forcePeriod: period,
+}));
+}
 return jsonResponse({ error: "Not found" }, 404);
 }
 // ── 统一鉴权闸门：/api/* 全部要求 X-Admin-Key ──
