@@ -6194,9 +6194,16 @@ const errText = await resp.text().catch(() => "");
 throw new Error(`LLM ${resp.status} [${provider.name}/${provider.model}]: ${errText.slice(0, 200)}`);
 }
 const data = await resp.json();
-const text = provider.protocol === "openai"
-? data?.choices?.[0]?.message?.content
-: data?.content?.[0]?.text;
+let text;
+if (provider.protocol === "openai") {
+text = data?.choices?.[0]?.message?.content;
+} else {
+const blocks = data?.content;
+if (Array.isArray(blocks)) {
+  const tb = blocks.find(b => b.type === "text");
+  text = tb?.text;
+}
+}
 if (!text || typeof text !== "string") throw new Error("LLM returned empty content");
 return text.trim();
 }
