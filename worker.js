@@ -6118,14 +6118,21 @@ model: "claude-haiku-4-5-20251001",
 };
 }
 
-// 从前端同步的 settings:global 取活跃 provider；fallback 到 config:llm + env 密钥
+// 从前端同步的 settings:global 取活跃 provider；按 chatTarget 选，fallback 到第一个启用的，再 fallback 到 env 密钥
 async function resolveProvider(env) {
 const settings = await kvGet(env, "settings:global");
 if (settings?.providers) {
-const p = settings.providers.find(x => x.enabled && x.apiKey);
-if (p) {
-const model = p.defaultModel && p.models?.includes(p.defaultModel)
-  ? p.defaultModel : (p.models?.[0] || "claude-haiku-4-5-20251001");
+const enabled = settings.providers.filter(x => x.enabled && x.apiKey);
+if (enabled.length) {
+let p = null;
+if (settings.chatTarget?.providerId) {
+  p = enabled.find(x => x.id === settings.chatTarget.providerId);
+}
+if (!p) p = enabled[0];
+const targetModel = (p.id === settings.chatTarget?.providerId && settings.chatTarget?.model) ? settings.chatTarget.model : null;
+const model = targetModel && p.models?.includes(targetModel)
+  ? targetModel
+  : (p.defaultModel && p.models?.includes(p.defaultModel) ? p.defaultModel : (p.models?.[0] || "claude-haiku-4-5-20251001"));
 let base = (p.baseUrl || "").replace(/\/+$/, "");
 if (!/\/v1$/.test(base)) base += "/v1";
 return {
