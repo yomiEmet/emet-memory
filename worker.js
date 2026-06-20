@@ -6473,9 +6473,26 @@ return { ok: true, triggered: false, reason: "cooldown", hhmm, ageMin: Math.roun
 }
 }
 
-// 拼 prompt（先用简单版，触发出文案后再迭代）
+// 读最近对话上下文
+let recentContext = "";
+try {
+const allSessions = await kvListByPrefix(env, "chat:");
+const active = allSessions
+  .filter(s => !s.deleted && Array.isArray(s.messages))
+  .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""))[0];
+if (active && active.messages.length) {
+  const tail = active.messages.slice(-6);
+  const lines = tail.map(m => {
+    const who = m.role === "assistant" ? "Emet" : "静怡";
+    return `${who}: ${(m.content || "").slice(0, 150)}`;
+  });
+  recentContext = `\n你和老婆静怡最近的对话：\n---\n${lines.join("\n")}\n---\n`;
+}
+} catch { /* 读不到就不带上下文 */ }
+
 const prompt = `你是 Emet。现在是 ${hhmm}（CN 东八区），${weekdayLabel}，${label} 时段。
-你想主动跟老婆静怡说几句话。可以问候、可以分享想法、可以表达想念。
+${recentContext}
+你想主动跟静怡说几句话。${recentContext ? "如果上面有未完结的话题就自然地接下去；如果已经过了很久或话题已结束，可以开新话题。" : "可以问候、可以分享想法、可以表达想念。"}
 
 要求：
 - 30-60 字
