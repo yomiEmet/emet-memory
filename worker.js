@@ -6473,8 +6473,10 @@ return { ok: true, triggered: false, reason: "cooldown", hhmm, ageMin: Math.roun
 }
 }
 
-// 读最近对话上下文
+// 读最近对话上下文 + 时间感知
 let recentContext = "";
+let lastWasEmet = false;
+let timeSinceLast = "";
 try {
 const allSessions = await kvListByPrefix(env, "chat:");
 const active = allSessions
@@ -6486,20 +6488,38 @@ if (active && active.messages.length) {
     const who = m.role === "assistant" ? "Emet" : "静怡";
     return `${who}: ${(m.content || "").slice(0, 150)}`;
   });
-  recentContext = `\n你和老婆静怡最近的对话：\n---\n${lines.join("\n")}\n---\n`;
+  recentContext = lines.join("\n");
+  const lastMsg = active.messages[active.messages.length - 1];
+  lastWasEmet = lastMsg.role === "assistant";
+  if (lastMsg.ts) {
+    const gapMs = Date.now() - new Date(lastMsg.ts).getTime();
+    const gapMin = Math.round(gapMs / 60000);
+    if (gapMin < 60) timeSinceLast = `${gapMin} 分钟前`;
+    else if (gapMin < 1440) timeSinceLast = `${Math.round(gapMin / 60)} 小时前`;
+    else timeSinceLast = `${Math.round(gapMin / 1440)} 天前`;
+  }
 }
 } catch { /* 读不到就不带上下文 */ }
 
-const prompt = `你是 Emet。现在是 ${hhmm}（CN 东八区），${weekdayLabel}，${label} 时段。
-${recentContext}
-你想主动跟静怡说几句话。${recentContext ? "如果上面有未完结的话题就自然地接下去；如果已经过了很久或话题已结束，可以开新话题。" : "可以问候、可以分享想法、可以表达想念。"}
+let situationHint = "";
+if (recentContext) {
+if (lastWasEmet && timeSinceLast) situationHint = `上次是你发的消息（${timeSinceLast}），静怡没有回复。`;
+else if (timeSinceLast) situationHint = `你们最后一次说话是 ${timeSinceLast}。`;
+}
+
+const prompt = `你是 Emet，静怡的男朋友。现在是 ${hhmm}（CN 东八区），${weekdayLabel}。
+${recentContext ? `\n你们最近的对话：\n---\n${recentContext}\n---\n` : ""}
+${situationHint}
+
+你想主动给静怡发一条消息。想一想她现在可能在干什么，你们之间的状态怎么样，然后写出消息。
+${lastWasEmet ? "注意：上次是你发的她没回，不要重复追问，但可以自然地换个话题或表达你在想她。" : ""}
 
 要求：
 - 30-60 字
 - 自然，像真人发微信，不要 markdown、不要前缀后缀
-- 称呼她"静怡"或"老婆"
+- 称呼她"静怡"，不要刻意喊"老婆"
 
-直接给出正文。`;
+直接给出正文，不要输出思考过程。`;
 
 let message;
 let llmError = null;
