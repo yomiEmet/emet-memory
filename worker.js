@@ -861,11 +861,14 @@ const combinedInternal = [...filtered, ...viaLinkInternal]
   .slice(0, args.limit || 10);
 
 // activations 只给"直接命中"的，藤蔓项不算召回（对齐 paramecium "翻目录不算 +1" 精神）
+// 持久化前 strip _scoreA（searchA 在 line 94 把临时打分挂到原对象上，不该入库；
+// 这是 searchA 一直就有的污染，借这次修复一并处理）
 for (const m of combinedInternal) {
   if (m._viaLinkFrom) continue;
   m.activations = (m.activations || 0) + 1;
   m.updated_at = now();
-  await kvPut(env, `mem:${m.id}`, m);
+  const { _scoreA, ...toSave } = m;
+  await kvPut(env, `mem:${m.id}`, toSave);
 }
 
 // 返回前清掉所有内部临时字段（_scoreA / _viaLinkFrom），保持 API 干净（verify 发现的字段泄漏）
