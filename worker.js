@@ -197,19 +197,10 @@ async function weaveCandidates(env, text, opts = {}) {
       const idfSum = shared.reduce((s, t) => s + idf(t), 0);
       tScore = Math.min(1, idfSum / (2 * maxIdf));
     }
-    // 硬过滤升级（防误连，2026-06-21 加固）:
-    //   (a) 两条"都有 tag 但无交集" → 强力抑制（防"番茄工作法 vs 番茄菜园"这种同字不同义）
-    //   (b) 任一无 tag + 向量弱  → 沿用原降权（陌生场景给个机会）
-    //   (c) 任一无 tag + 向量强  → 适度放行（高语义相关但用户没标 tag）
-    if (shared.length === 0) {
-      const bothHaveTags = optsTags.length > 0 && mt.length > 0;
-      if (bothHaveTags) {
-        m._weave = v * 0.2;     // 都标了 tag 却无交集 → 几乎不进候选
-      } else if (v < 0.7) {
-        m._weave = v * 0.3;
-      } else {
-        m._weave = v * 0.55;
-      }
+    // 硬过滤（保留原逻辑）：tag 无交集 → 看向量；向量弱再降权
+    // 注：verify 发现"都标 tag 但无交集 → ×0.2"会误伤合法关联（如 #健康 vs #妈 其实是说妈健康），已撤回
+    if (shared.length === 0 && v < 0.7) {
+      m._weave = v * 0.3;
     } else {
       m._weave = v * 0.55 + tScore * 0.45;
     }
@@ -488,7 +479,7 @@ async function handleRetag(request, env) {
 async function handleWeaveBackfill(request, env) {
   const url = new URL(request.url);
   const apply = url.searchParams.get("apply") === "1";
-  const threshold = parseFloat(url.searchParams.get("threshold") || "0.55");
+  const threshold = parseFloat(url.searchParams.get("threshold") || "0.50");
   const topN = parseInt(url.searchParams.get("top") || "3", 10);
 
   const all = await kvListByPrefix(env, "mem:");
@@ -813,8 +804,8 @@ await kvPut(env, `mem:${id}`, memory);
 // 真·全自动织藤:存完后跑 weave,分数 ≥ 0.6 的前 3 条旧记忆直接双向关联（和手动连一致，标记"自动关联"）
 try {
   const cands = await weaveCandidates(env, memory.content, { tags: memory.tags, exclude_id: id, limit: 5 });
-  // 阈值 0.42 → 0.55（2026-06-21 加固，减误连约 40%；漏掉的真关联用户可手动连）
-  const top = cands.filter(c => c.score >= 0.55).slice(0, 3);
+  // 阈值 0.42 → 0.50（verify 说 0.55 太严会让新记忆孤立；0.50 既减误连又保留真关联）
+  const top = cands.filter(c => c.score >= 0.50).slice(0, 3);
   memory.linked = memory.linked || [];
   memory.link_rel = memory.link_rel || {};
   let linkedAny = false;
@@ -843,46 +834,56 @@ limit: args.limit || 10,
 category: args.category
 });
 
-// ── 沿藤蔓走一步（2026-06-21 加）──
-// 把直中条目的 linked 另一头也拉进来，标 _viaLink、分数 ×0.6 衰减，最后统一按分数排序截断。
-// 用内存 idMap 避免 N+1（数据已经在 all 里）。
+// ── 沿藤蔓走一步（2026-06-21 加 / verify 修：clone 防引用污染 + 返回前清理内部字段）──
+// 直中条目的 linked 另一头作为补充拉进来，分数 ×0.6 衰减，最后按分数排序截断。
 const idMap = new Map(all.map(m => [m.id, m]));
 const seenIds = new Set(filtered.map(m => m.id));
-const viaLink = [];
+const viaLinkInternal = [];
 for (const mem of filtered) {
   if (!Array.isArray(mem.linked)) continue;
   for (const lid of mem.linked) {
     if (seenIds.has(lid)) continue;
-    const lm = idMap.get(lid);
-    if (!lm || lm.archived) continue;
-    if (args.category && args.category !== "all" && lm.category !== args.category) continue;
-    // 藤蔓项基准分（不重跑 searchA）：importance + recency 兜底，再 ×0.6 衰减
+    const src = idMap.get(lid);
+    if (!src || src.archived) continue;
+    if (args.category && args.category !== "all" && src.category !== args.category) continue;
+    // clone 后再加临时字段，避免污染 all 数组里的原对象（verify 发现引用复用 bug）
+    const lm = { ...src };
     const base = ((lm.importance || 5) / 10) * 0.5 + calcRecency(lm) * 0.5;
     lm._scoreA = base * 0.6;
-    lm._viaLink = true;
-    lm.via_link_from = mem.id;  // 透明化：标出从哪条藤蔓拉过来
-    viaLink.push(lm);
+    lm._viaLinkFrom = mem.id;
+    viaLinkInternal.push(lm);
     seenIds.add(lid);
   }
 }
 
-const combined = [...filtered, ...viaLink]
-  .sort((a, b) => b._scoreA - a._scoreA)
+const combinedInternal = [...filtered, ...viaLinkInternal]
+  .sort((a, b) => (b._scoreA || 0) - (a._scoreA || 0))
   .slice(0, args.limit || 10);
 
-// activations 只给"直接命中"的，藤蔓拉出来的不算召回（避免污染重要度排序，对齐 paramecium "翻目录不算 +1" 精神）
-for (const m of combined) {
-  if (m._viaLink) continue;
+// activations 只给"直接命中"的，藤蔓项不算召回（对齐 paramecium "翻目录不算 +1" 精神）
+for (const m of combinedInternal) {
+  if (m._viaLinkFrom) continue;
   m.activations = (m.activations || 0) + 1;
   m.updated_at = now();
   await kvPut(env, `mem:${m.id}`, m);
 }
 
+// 返回前清掉所有内部临时字段（_scoreA / _viaLinkFrom），保持 API 干净（verify 发现的字段泄漏）
+let viaLinkCount = 0;
+const results = combinedInternal.map(m => {
+  const { _scoreA, _viaLinkFrom, ...clean } = m;
+  if (_viaLinkFrom) {
+    viaLinkCount++;
+    clean.via_link = { from: _viaLinkFrom };  // 透明化用嵌套字段，不污染主对象顶层
+  }
+  return clean;
+});
+
 return {
-  results: combined,
-  count: combined.length,
-  direct_count: filtered.length,
-  via_link_count: combined.filter(m => m._viaLink).length
+  results,
+  count: results.length,
+  direct_count: results.length - viaLinkCount,
+  via_link_count: viaLinkCount
 };
 }
 case "memory_list": {
