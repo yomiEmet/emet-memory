@@ -6283,38 +6283,31 @@ model: "claude-haiku-4-5-20251001",
 }
 
 // 从前端同步的 settings:global 取活跃 provider；按 chatTarget 选，fallback 到第一个启用的，再 fallback 到 env 密钥
+// 严格模式：所有 LLM 调用必须走前端可见的 enabled provider。
+// 没 enabled provider 直接抛错——杜绝悄悄走 ANTHROPIC_API_KEY 直连烧钱。
 async function resolveProvider(env) {
 const settings = await kvGet(env, "settings:global");
-if (settings?.providers) {
-const enabled = settings.providers.filter(x => x.enabled && x.apiKey);
-if (enabled.length) {
+const enabled = (settings?.providers || []).filter(x => x.enabled && x.apiKey);
+if (!enabled.length) {
+throw new Error("no enabled provider: 请在前端启用一个供应商");
+}
 let p = null;
 if (settings.chatTarget?.providerId) {
-  p = enabled.find(x => x.id === settings.chatTarget.providerId);
+p = enabled.find(x => x.id === settings.chatTarget.providerId);
 }
 if (!p) p = enabled[0];
 const targetModel = (p.id === settings.chatTarget?.providerId && settings.chatTarget?.model) ? settings.chatTarget.model : null;
 const model = targetModel && p.models?.includes(targetModel)
-  ? targetModel
-  : (p.defaultModel && p.models?.includes(p.defaultModel) ? p.defaultModel : (p.models?.[0] || "claude-haiku-4-5-20251001"));
+? targetModel
+: (p.defaultModel && p.models?.includes(p.defaultModel) ? p.defaultModel : (p.models?.[0] || "claude-haiku-4-5-20251001"));
 let base = (p.baseUrl || "").replace(/\/+$/, "");
 if (!/\/v1$/.test(base)) base += "/v1";
 return {
-  endpoint: base + (p.protocol === "openai" ? "/chat/completions" : "/messages"),
-  apiKey: p.apiKey,
-  model,
-  protocol: p.protocol || "anthropic",
-  name: p.name || "unknown",
-};
-}
-}
-const cfg = (await kvGet(env, "config:llm")) || defaultLlmConfig();
-return {
-endpoint: cfg.endpoint,
-apiKey: env.ANTHROPIC_API_KEY,
-model: cfg.model,
-protocol: "anthropic",
-name: "env-fallback",
+endpoint: base + (p.protocol === "openai" ? "/chat/completions" : "/messages"),
+apiKey: p.apiKey,
+model,
+protocol: p.protocol || "anthropic",
+name: p.name || "unknown",
 };
 }
 
@@ -7011,6 +7004,29 @@ forcePeriod: period,
 if (path === "/api/admin/device-status") {
 const raw = await env.MEMORY.get("device:status");
 return jsonResponse({ device: raw ? JSON.parse(raw) : null });
+}
+// 看最近 N 条心跳/凌晨守护日志，用来排查"消息是真 LLM 生成还是兜底文案"
+if (path === "/api/admin/recent-logs") {
+const which = url.searchParams.get("which") || "heartbeat"; // heartbeat | night_guard
+const limit = Math.min(parseInt(url.searchParams.get("limit") || "5", 10) || 5, 30);
+const prefix = which === "night_guard" ? "night_guard:log:" : "heartbeat:log:";
+const list = await env.MEMORY.list({ prefix });
+const recent = list.keys.sort((a, b) => b.name.localeCompare(a.name)).slice(0, limit);
+const logs = [];
+for (const k of recent) {
+  const raw = await env.MEMORY.get(k.name);
+  if (raw) {
+    const entry = JSON.parse(raw);
+    logs.push({
+      ts: entry.ts,
+      message: entry.message,
+      llmError: entry.llmError,
+      providerName: entry.provider?.name,
+      providerModel: entry.provider?.model,
+    });
+  }
+}
+return jsonResponse({ which, logs });
 }
 return jsonResponse({ error: "Not found" }, 404);
 }
