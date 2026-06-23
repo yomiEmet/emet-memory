@@ -645,6 +645,18 @@ inputSchema: { type: "object", properties: {
 to: { type: "string", enum: ["emet","yomi","all"], default: "all" },
 unread_only: { type: "boolean", default: true }
 } } },
+{ name: "mood_set", description: "记录某天的心情（你和静怡共用一个心情日历，你记自己的就行）。mood 七选一：happy 开心 / calm 平静 / heart 心动 / excited 兴奋 / sad 难过 / anxious 焦虑 / tired 疲惫。同一人同一天再记会覆盖。",
+inputSchema: { type: "object", properties: {
+mood: { type: "string", enum: ["happy","calm","heart","excited","sad","anxious","tired"] },
+note: { type: "string", description: "可选，一句话说明为什么这个心情" },
+who: { type: "string", enum: ["emet","yomi"], default: "emet" },
+date: { type: "string", description: "可选，YYYY-MM-DD，默认今天（东八区）" }
+}, required: ["mood"] } },
+{ name: "mood_list", description: "查心情日历记录。可传 start/end（YYYY-MM-DD）限定范围，默认最近 90 天。返回你和静怡两人的记录。",
+inputSchema: { type: "object", properties: {
+start: { type: "string" },
+end: { type: "string" }
+} } },
 { name: "handoff_save", description: "保存交接信。",
 inputSchema: { type: "object", properties: {
 content: { type: "string" },
@@ -1092,6 +1104,39 @@ if (args.unread_only) filtered = filtered.filter(m => !m.read);
 filtered.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 for (const m of filtered) { m.read = true; await kvPut(env, `msg:${m.id}`, m); }
 return { messages: filtered };
+}
+case "mood_set": {
+const valMap = { happy: 0.8, calm: 0.3, heart: 0.7, excited: 0.9, sad: -0.6, anxious: -0.4, tired: -0.2 };
+if (!valMap.hasOwnProperty(args.mood)) return { error: "未知心情: " + args.mood };
+const who = args.who === "yomi" ? "yomi" : "emet";
+const date = (typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date))
+  ? args.date
+  : cnNow().toISOString().slice(0, 10);
+const key = `mood:${date}:${who}`;
+const existing = await kvGet(env, key);
+const entry = {
+  date, who, mood: args.mood, note: args.note || "",
+  valence: valMap[args.mood],
+  created_at: existing?.created_at || now(),
+  updated_at: now(),
+};
+await kvPut(env, key, entry);
+return { success: true, date, who, mood: args.mood };
+}
+case "mood_list": {
+const all = await kvListByPrefix(env, "mood:");
+let start = (typeof args.start === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.start)) ? args.start : null;
+let end = (typeof args.end === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.end)) ? args.end : null;
+if (!start && !end) {
+  // 默认最近 90 天
+  const d = new Date(cnNow().getTime() - 90 * 86400000);
+  start = d.toISOString().slice(0, 10);
+}
+let list = all.filter(e => e && e.date);
+if (start) list = list.filter(e => e.date >= start);
+if (end) list = list.filter(e => e.date <= end);
+list.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+return { moods: list };
 }
 case "handoff_save": {
 const id = generateId();
@@ -1720,6 +1765,19 @@ return restPut("msg:", id, body, ["content","from","to","locked"]);
 if (path === "/api/message" && method === "POST") {
 const body = await request.json();
 return jsonResponse(await executeTool("message_leave", body, env));
+}
+
+// 心情日历：GET 查范围，POST 记一笔（静怡走前端 who=yomi，Emet 走 MCP who=emet）
+if (path === "/api/mood") {
+if (method === "GET") {
+const start = url.searchParams.get("start") || undefined;
+const end = url.searchParams.get("end") || undefined;
+return jsonResponse(await executeTool("mood_list", { start, end }, env));
+}
+if (method === "POST") {
+const body = await request.json();
+return jsonResponse(await executeTool("mood_set", body, env));
+}
 }
 
 // 跨模块搬移（前端三点菜单"移动到…"用）
