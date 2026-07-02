@@ -583,6 +583,15 @@ query: { type: "string" },
 category: { type: "string", enum: ["core","scene","emotion","semantic","image","procedure","all"], default: "all" },
 limit: { type: "number", default: 10 }
 }, required: ["query"] } },
+// Paramecium 移植：recall 工具（定义随 tools 进缓存前缀，措辞改动=全量缓存作废，改前三思）
+{ name: "recall", description: "搜索你们的长期记忆并返回原文。两层数据：vault（手写记忆+日记+自动摘录）+ archive（全部聊天原文的逐字存档），语义检索默认两层都搜。<memory_index>里是和当前话题相关的记忆目录（只有标题）——想看条目细节、或想搜目录之外的内容时用这个。exact=true按原文逐字检索（适合找「她原话怎么说的」，需要至少3个字）。问到「最近/上周」这类时间问题时自己换算日期填after/before。存档命中会带conv_id，把它传回来可以在那场对话里继续深挖。",
+inputSchema: { type: "object", properties: {
+query: { type: "string", description: "检索词，自然语言或关键词" },
+exact: { type: "boolean", description: "true=原文逐字检索(FTS)，省略=语义检索" },
+after: { type: "string", description: "只看此日期之后(YYYY-MM-DD)，作用于archive层" },
+before: { type: "string", description: "只看此日期之前(YYYY-MM-DD)，作用于archive层" },
+conv_id: { type: "string", description: "只搜这一场对话的存档（用之前命中带的conv_id）" }
+}, required: ["query"] } },
 { name: "memory_list", description: "列出记忆摘要。",
 inputSchema: { type: "object", properties: {
 category: { type: "string", enum: ["core","scene","emotion","semantic","image","procedure","all"], default: "all" },
@@ -900,6 +909,25 @@ return {
   direct_count: results.length - viaLinkCount,
   via_link_count: viaLinkCount
 };
+}
+case "recall": {
+// Paramecium 移植：exact=逐字FTS；语义=vault(L1混检,计access)+archive(L0向量)双层并查，分段标注来源
+const query = String(args.query || "").trim();
+if (!query) return { error: "query required" };
+if (args.exact) {
+const rs = await mem2RawSearch(env, query, 6);
+if (!rs.length) return { __raw_text: "原文检索无结果。提示：逐字匹配整个短语、至少3个字；可换更短的词组，或去掉exact用语义检索。" };
+return { __raw_text: rs.map(r => `[${r.date} ${r.source} ${r.role}] ${r.content}`).join("\n---\n") };
+}
+const [vault, archive] = await Promise.all([
+args.conv_id ? Promise.resolve([]) : mem2SearchL1(env, query, 4, true), // recall 命中才计 access
+mem2ArchiveSearch(env, { query, n: 4, after: args.after, before: args.before, conv_id: args.conv_id }),
+]);
+const parts = [];
+if (vault.length) parts.push(vault.map(v => `[${v.date} ${v.category}] ${v.document}`).join("\n---\n"));
+if (archive.length) parts.push("——聊天原文存档——\n" + archive.map(a => `${a.document}\n(conv_id=${a.metadata.conv_id})`).join("\n---\n"));
+if (!parts.length) return { __raw_text: "没有找到相关记忆" + ((args.after || args.before) ? "（试试放宽日期范围）" : "") };
+return { __raw_text: parts.join("\n\n") };
 }
 case "memory_list": {
 const all = await kvListByPrefix(env, "mem:");
@@ -1338,7 +1366,9 @@ if (method === "tools/call") {
 const { name, arguments: args } = params;
 try {
 const result = await executeTool(name, args || {}, env);
-return jsonResponse({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] } });
+// __raw_text：长原文类结果（recall）直接给纯文本，不经 JSON 转义（可读性）
+const text = result && typeof result.__raw_text === "string" ? result.__raw_text : JSON.stringify(result, null, 2);
+return jsonResponse({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }] } });
 } catch (e) {
 return jsonResponse({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `错误: ${e.message}` }], isError: true } });
 }
@@ -6237,21 +6267,28 @@ async function mem2ArchiveSearch(env, { query, n = 5, max_distance, per_conv = 2
 // L1 混合检索：向量道（手写记忆 vec:* + 摘录 Vectorize layer=extract）+ FTS 道（raw vault 行）
 // RRF 融合（rank 1 → 1.0）→ 时效因子（60天常数、只占30%权重——旧记忆最多打七折不消失）
 // → access 对数加成（越被想起越容易再被想起，对数压制）。paramecium 4a 原配方。
-async function mem2SearchL1(env, query, n = 5, logAccess = true) {
+async function mem2LoadMemVectors(env) {
+  const mems = await kvListByPrefix(env, "mem:");
+  const vecs = new Map();
+  for (const m of mems) {
+    try {
+      const raw = await env.MEMORY.get("vec:" + m.id);
+      if (raw) vecs.set(m.id, JSON.parse(raw));
+    } catch (e) {}
+  }
+  return { mems, vecs };
+}
+
+async function mem2SearchL1(env, query, n = 5, logAccess = true, preload = null) {
   n = Math.min(n || 5, 20);
   const qv = await embedText(env, query);
   const items = new Map(); // id → { id, date, category, document, dist, ftsRank, access }
-  // 向量道 A：手写记忆（现有 vec:* KV 暴力余弦，与 memory_search 同源）
-  const mems = await kvListByPrefix(env, "mem:");
+  // 向量道 A：手写记忆（现有 vec:* KV 暴力余弦，与 memory_search 同源；preload 供注入双道共用）
+  const { mems, vecs } = preload || await mem2LoadMemVectors(env);
   const memById = new Map(mems.map(m => [m.id, m]));
   if (qv) {
     const scores = new Map();
-    for (const m of mems) {
-      try {
-        const raw = await env.MEMORY.get("vec:" + m.id);
-        if (raw) scores.set(m.id, cosineSim(qv, JSON.parse(raw)));
-      } catch (e) {}
-    }
+    for (const [id, v] of vecs) scores.set(id, cosineSim(qv, v));
     for (const [id, sim] of scores) {
       const m = memById.get(id);
       if (!m) continue;
@@ -6338,7 +6375,8 @@ async function mem2SearchL1(env, query, n = 5, logAccess = true) {
 // 用户道 n=5 相对距离过滤（自然句查询距离整体偏高，硬线会卡死注入——2026-06-10 教训）；
 // echo 道 n=3 只过硬线（"回复的余味"，两道互不设卡）；按 id 去重。注入一律不计 access。
 async function mem2BuildInjection(env, context, echo) {
-  const usr = await mem2SearchL1(env, context, 5, false);
+  const preload = await mem2LoadMemVectors(env); // 用户/echo 双道共用一次装载
+  const usr = await mem2SearchL1(env, context, 5, false, preload);
   const dists = usr.map(x => x.distance).filter(d => typeof d === "number");
   const best = dists.length ? Math.min(...dists) : null;
   const cut = best === null ? MEM2_HARD_DIST : Math.min(best + MEM2_REL_WINDOW, MEM2_HARD_DIST);
@@ -6346,7 +6384,7 @@ async function mem2BuildInjection(env, context, echo) {
   let echoHits = [];
   if (echo && String(echo).trim()) {
     const seen = new Set(hits.map(x => x.id));
-    echoHits = (await mem2SearchL1(env, String(echo).slice(0, 500), 3, false))
+    echoHits = (await mem2SearchL1(env, String(echo).slice(0, 500), 3, false, preload))
       .filter(x => (typeof x.distance !== "number" || x.distance < MEM2_HARD_DIST) && !seen.has(x.id));
   }
   const lines = [...hits, ...echoHits].map(x => {
