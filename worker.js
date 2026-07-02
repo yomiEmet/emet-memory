@@ -6116,11 +6116,17 @@ async function mem2ImportConv(env, conv) {
 }
 
 // 会话变更打脏标（chat PUT/sync/appendToActiveSession 三处调用），失败静默——同步主流程优先
+// dirty: 给 L0 装订工；extdirty: 给 L1 摘录员（摘录关着时由 runExtraction 定期清空）
 async function mem2MarkDirty(env, convId) {
   try {
-    await env.DB.prepare(
-      "INSERT INTO sync_state (key, value, updated_at) VALUES (?, '1', datetime('now')) ON CONFLICT(key) DO UPDATE SET value='1', updated_at=datetime('now')"
-    ).bind("dirty:" + convId).run();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO sync_state (key, value, updated_at) VALUES (?, '1', datetime('now')) ON CONFLICT(key) DO UPDATE SET value='1', updated_at=datetime('now')"
+      ).bind("dirty:" + convId),
+      env.DB.prepare(
+        "INSERT INTO sync_state (key, value, updated_at) VALUES (?, '1', datetime('now')) ON CONFLICT(key) DO UPDATE SET value='1', updated_at=datetime('now')"
+      ).bind("extdirty:" + convId),
+    ]);
   } catch (e) { /* D1 抖动不能拖垮聊天同步 */ }
 }
 
@@ -6397,6 +6403,150 @@ async function mem2BuildInjection(env, context, echo) {
   return { injection, hits: hits.length, echo_hits: echoHits.length, token_estimate: mem2CountTokens(injection) };
 }
 
+// ════════════════════════════════════════════════════════════
+// Paramecium 移植：L1 摘录员（extract-memories.mjs）
+// 「摘录不是创作」：便宜模型圈重点，每条必须带原文逐字引用；
+// 机械校验（规范化后≥8字且是原文子串）否则整条丢弃——这是对
+// 旧拆分工「36% 转述当正文」事故的教训修正（设计法则：模型产物
+// 必须有逐字引用锚定）。prompt 逐字迁移，仅称呼改静怡/Emet。
+// 默认关闭（config:extraction，沿用 daily/heartbeat 先例）。
+// 边构建/矛盾supersede 本轮不移植。
+// ════════════════════════════════════════════════════════════
+const MEM2_EXT_MIN_NEW = 4;   // 新消息不足 4 条不跑
+const MEM2_EXT_BATCH = 30;    // 每会话每轮最多喂 30 条（起点回退 2 条做上下文重叠）
+const MEM2_EXT_CONVS_PER_RUN = 3;
+
+function mem2ExtRenderMsgs(msgs, fallbackTs) {
+  return msgs.map(m => {
+    const d = m.ts ? new Date(m.ts) : (fallbackTs ? new Date(fallbackTs) : null);
+    const stamp = d && !isNaN(d) ? new Date(d.getTime() + 8 * 3600e3).toISOString().slice(0, 16).replace("T", " ") : "?";
+    const who = m.role === "user" ? "静怡" : "我";
+    let text = mem2TextOf(m.content);
+    if (text.length > 1500) text = text.slice(0, 1500) + "…";
+    return `[${stamp}] ${who}: ${text}`;
+  }).join("\n\n");
+}
+
+function mem2ExtractPrompt(convTitle, today, convText) {
+  return `你是一个记忆摘录系统。下面是一段对话记录，对话双方是"我"（AI伴侣Emet）和"静怡"。
+
+你的工作是「摘录」不是「创作」：圈出对话里值得记住的信息点，并为每条附上原文引用。
+
+要求：
+- 每条记忆带上日期（从对话时间戳推断，格式 YYYY-MM-DD）
+- content：用"我"的视角简洁记录这个信息点，贴近原文，不展开不演绎
+- quote：从对话原文中【逐字】复制的一句话（10-40字），作为这条记忆的出处证据。必须与原文完全一致，不许改写
+- 事实性的（她的偏好、经历、状态）和叙事性的（情绪时刻）都可以摘
+- 宁缺勿滥：没有值得记的就返回空数组
+- 最多5条
+
+对话标题: ${convTitle || "(无标题)"}
+今天日期: ${today}
+
+输出格式（严格JSON数组）:
+[
+  {"date": "2026-06-01", "content": "记忆内容...", "quote": "原文逐字引用"},
+  ...
+]
+
+只输出JSON数组，不要其他文字。
+
+---
+对话内容:
+
+${convText}`;
+}
+
+async function runExtraction(env, opts = {}) {
+  const cfg = (await kvGet(env, "config:extraction")) || { enabled: false };
+  if (!cfg.enabled && !opts.bypassDisabled) {
+    // 关着的时候顺手清空信号队列，防止无限堆积；开启后用 extract-backfill 重新标记
+    try { await env.DB.prepare("DELETE FROM sync_state WHERE key LIKE 'extdirty:%'").run(); } catch (e) {}
+    return { skipped: "disabled" };
+  }
+  const dirty = await env.DB.prepare(
+    "SELECT key FROM sync_state WHERE key LIKE 'extdirty:%' ORDER BY updated_at LIMIT ?"
+  ).bind(MEM2_EXT_CONVS_PER_RUN).all();
+  const rows = dirty.results || [];
+  let extracted = 0, dropped = 0, convs = 0;
+  for (const row of rows) {
+    const convId = row.key.slice(9);
+    const clearRow = env.DB.prepare("DELETE FROM sync_state WHERE key = ?").bind(row.key);
+    const conv = await kvGet(env, "chat:" + convId);
+    if (!conv || conv.deleted) { await clearRow.run(); continue; }
+    const msgs = (conv.messages || []).filter(m =>
+      (m.role === "user" || m.role === "assistant") && !m.distill && mem2TextOf(m.content).trim()
+    );
+    const stRow = await env.DB.prepare("SELECT value FROM sync_state WHERE key = ?").bind("extract:" + convId).first();
+    let state = { extractedUpTo: 0 };
+    try { if (stRow) state = JSON.parse(stRow.value); } catch (e) {}
+    if (msgs.length - (state.extractedUpTo || 0) < MEM2_EXT_MIN_NEW) { await clearRow.run(); continue; }
+    const start = Math.max(0, (state.extractedUpTo || 0) - 2); // 2 条重叠给上下文
+    const batch = msgs.slice(start, start + MEM2_EXT_BATCH);
+    const convText = mem2ExtRenderMsgs(batch, conv.created_at);
+    const today = mem2DateOf(new Date().toISOString());
+    let entries = [];
+    try {
+      // 不传 temperature：思考类模型（如 opus-think）只接受 1，摘录质量由机械校验兜底
+      const { text } = await callLLM(env, mem2ExtractPrompt(conv.title, today, convText), 2000, {
+        model: cfg.model || undefined,
+      });
+      const m = text.match(/\[[\s\S]*\]/); // 容忍 markdown 围栏
+      entries = m ? JSON.parse(m[0]) : [];
+    } catch (e) {
+      // 模型/解析失败：保留 extdirty 下轮重试
+      try {
+        await env.DB.prepare(
+          "INSERT INTO sync_state (key, value, updated_at) VALUES ('meta:l1-lasterr', ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')"
+        ).bind(String(e.message || e).slice(0, 300)).run();
+      } catch (e2) {}
+      continue;
+    }
+    // 机械校验（机械 > prompt 善意）：quote 规范化≥8字、必须是本批原文子串、content≥10字、硬顶5条
+    const norm = s => String(s || "").replace(/\s+/g, "");
+    const normSrc = norm(convText);
+    const good = (Array.isArray(entries) ? entries : []).filter(e => {
+      if (!e || typeof e !== "object") return false;
+      const q = norm(e.quote);
+      if (q.length < 8 || !normSrc.includes(q)) { dropped++; return false; }
+      return String(e.content || "").length >= 10;
+    }).slice(0, 5);
+    const stmts = [];
+    const points = [];
+    for (const e of good) {
+      const id = "ext:" + convId.slice(0, 8) + ":" + Date.now().toString(36) + ":" + Math.random().toString(36).slice(2, 6);
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(e.date || "") ? e.date : today;
+      stmts.push(env.DB.prepare(
+        "INSERT INTO l1_memories (id, content, quote, date, conv_id, source) VALUES (?,?,?,?,?,?)"
+      ).bind(id, e.content, e.quote, date, convId, "extraction"));
+      points.push({ id, text: e.content, date });
+    }
+    if (points.length) {
+      const vecs = await mem2EmbedBatch(env, points.map(p => p.text));
+      const ups = points.map((p, i) => ({
+        id: p.id, values: vecs[i],
+        metadata: { layer: "extract", conv_id: convId, date: p.date, date_int: parseInt(p.date.replace(/-/g, ""), 10) || 0 },
+      })).filter(p => Array.isArray(p.values));
+      if (ups.length) await env.VEC.upsert(ups);
+    }
+    const newUpTo = start + batch.length;
+    const remaining = msgs.length - newUpTo;
+    stmts.push(env.DB.prepare(
+      "INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')"
+    ).bind("extract:" + convId, JSON.stringify({ extractedUpTo: newUpTo, lastExtracted: now(), title: conv.title || "" })));
+    if (remaining < MEM2_EXT_MIN_NEW) stmts.push(clearRow); // 没追完留着下轮继续（每会话每轮一批）
+    await env.DB.batch(stmts);
+    extracted += good.length; convs++;
+  }
+  const result = { convs, extracted, dropped, pending_more: rows.length >= MEM2_EXT_CONVS_PER_RUN };
+  try {
+    await env.DB.prepare(
+      "INSERT INTO sync_state (key, value, updated_at) VALUES ('meta:l1-lastrun', ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')"
+    ).bind(JSON.stringify(result)).run();
+  } catch (e) {}
+  return result;
+}
+
 // /api/mem2/* 子路由（鉴权在 routeRequest 统一做，checkMcpAuth 级别）
 async function handleMem2(request, env) {
   const url = new URL(request.url);
@@ -6455,6 +6605,33 @@ async function handleMem2(request, env) {
     const body = await request.json();
     return jsonResponse(await mem2BuildInjection(env, String(body.context || ""), body.echo));
   }
+  if (path === "/api/mem2/extract-run" && method === "POST") {
+    const force = url.searchParams.get("force") === "1";
+    return jsonResponse(await runExtraction(env, { bypassDisabled: force }));
+  }
+  if (path === "/api/mem2/extract-backfill" && method === "POST") {
+    let cursor, marked = 0;
+    do {
+      const page = await env.MEMORY.list({ prefix: "chat:", cursor });
+      for (const k of page.keys) {
+        try {
+          await env.DB.prepare(
+            "INSERT INTO sync_state (key, value, updated_at) VALUES (?, '1', datetime('now')) ON CONFLICT(key) DO UPDATE SET value='1', updated_at=datetime('now')"
+          ).bind("extdirty:" + k.name.slice(5)).run();
+          marked++;
+        } catch (e) {}
+      }
+      cursor = page.list_complete ? null : page.cursor;
+    } while (cursor);
+    return jsonResponse({ marked });
+  }
+  if (path === "/api/mem2/extracts" && method === "GET") {
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 200);
+    const rs = await env.DB.prepare(
+      "SELECT id, content, quote, date, conv_id, access_count, superseded_by, created_at FROM l1_memories ORDER BY created_at DESC LIMIT ?"
+    ).bind(limit).all();
+    return jsonResponse({ extracts: rs.results || [] });
+  }
   return jsonResponse({ error: "Not found" }, 404);
 }
 
@@ -6486,6 +6663,7 @@ if (event.cron === "0,30 * * * *") {
 ctx.waitUntil(runHeartbeat(env));
 ctx.waitUntil(runKeepalive(env).catch(() => {})); // 缓存保活（与心跳互相独立，零副作用）
 ctx.waitUntil(runArchiveImport(env).catch(() => {})); // L0 装订工：只消化脏会话，无脏即空转
+ctx.waitUntil(runExtraction(env).catch(() => {})); // L1 摘录员：默认关（config:extraction），关着时只清信号队列
 // CN 22:30（UTC 14:30）那次顺便生成 daily 日记
 const cn = cnNow();
 if (cn.getUTCHours() === 14 && cn.getUTCMinutes() >= 30) {
@@ -6897,9 +7075,12 @@ name: p.name || "unknown",
 }
 
 // 统一 LLM 调用：自动识别 Anthropic 原生 / OpenAI 兼容协议
-async function callLLM(env, prompt, maxTokens = 200) {
+// opts.model / opts.temperature：可选覆盖（L1 摘录员用便宜模型时传入），不传行为不变
+async function callLLM(env, prompt, maxTokens = 200, opts = {}) {
 const provider = await resolveProvider(env);
 if (!provider.apiKey) throw new Error("No API key: neither frontend provider nor env.ANTHROPIC_API_KEY");
+const model = opts.model || provider.model;
+const extra = typeof opts.temperature === "number" ? { temperature: opts.temperature } : {};
 
 let resp;
 if (provider.protocol === "openai") {
@@ -6910,9 +7091,10 @@ resp = await fetch(provider.endpoint, {
     "Authorization": `Bearer ${provider.apiKey}`,
   },
   body: JSON.stringify({
-    model: provider.model,
+    model,
     max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
+    ...extra,
   }),
 });
 } else {
@@ -6924,16 +7106,17 @@ resp = await fetch(provider.endpoint, {
     "content-type": "application/json",
   },
   body: JSON.stringify({
-    model: provider.model,
+    model,
     max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
+    ...extra,
   }),
 });
 }
 
 if (!resp.ok) {
 const errText = await resp.text().catch(() => "");
-throw new Error(`LLM ${resp.status} [${provider.name}/${provider.model}]: ${errText.slice(0, 200)}`);
+throw new Error(`LLM ${resp.status} [${provider.name}/${model}]: ${errText.slice(0, 200)}`);
 }
 const data = await resp.json();
 let text, thinking = null;
@@ -7544,6 +7727,24 @@ catch { return jsonResponse({ error: "invalid json" }, 400); }
 if (typeof body?.enabled !== "boolean") return jsonResponse({ error: "enabled must be boolean" }, 400);
 const cfg = { enabled: body.enabled };
 await kvPut(env, "config:keepalive", cfg);
+return jsonResponse({ success: true, config: cfg });
+}
+return jsonResponse({ error: "method not allowed" }, 405);
+}
+
+// Paramecium L1 摘录员开关（默认关）；model 可选=用便宜模型摘录，空=跟随聊天供应商默认模型
+if (path === "/api/config/extraction") {
+if (method === "GET") {
+const cfg = (await kvGet(env, "config:extraction")) || { enabled: false, model: "" };
+return jsonResponse({ config: cfg });
+}
+if (method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+if (typeof body?.enabled !== "boolean") return jsonResponse({ error: "enabled must be boolean" }, 400);
+const cfg = { enabled: body.enabled, model: typeof body.model === "string" ? body.model.trim() : "" };
+await kvPut(env, "config:extraction", cfg);
 return jsonResponse({ success: true, config: cfg });
 }
 return jsonResponse({ error: "method not allowed" }, 405);
