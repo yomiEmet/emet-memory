@@ -1816,6 +1816,7 @@ if (path === "/api/chat/sync" && method === "POST") {
     if (!s || !s.id) continue;
     const existing = await kvGet(env, "chat:" + s.id);
     await kvPut(env, "chat:" + s.id, mergeSession(existing, s));
+    await mem2MarkDirty(env, s.id); // L0 装订工增量信号
   }
   const all = await kvListByPrefix(env, "chat:");
   return jsonResponse({ sessions: all, server_time: now() });
@@ -1827,6 +1828,7 @@ if (chatMatch && method === "PUT") {
   const existing = await kvGet(env, "chat:" + id);
   const merged = mergeSession(existing, { ...body, id });
   await kvPut(env, "chat:" + id, merged);
+  await mem2MarkDirty(env, id); // L0 装订工增量信号
   return jsonResponse({ success: true, item: merged });
 }
 if (chatMatch && method === "DELETE") {
@@ -1834,6 +1836,7 @@ if (chatMatch && method === "DELETE") {
   const existing = await kvGet(env, "chat:" + id);
   const tomb = { ...(existing || { id }), id, deleted: true, updated_at: now() };
   await kvPut(env, "chat:" + id, tomb);
+  await mem2MarkDirty(env, id); // 删除也打脏：装订工会顺带清掉它的存档
   return jsonResponse({ success: true });
 }
 
@@ -5940,6 +5943,483 @@ await kvPut(env, `diary:${id}`, entry);
 return { ok: true, id, title, date: dateStr, materialCount: { diaries: material.diaries.length, moments: material.moments.length, health: (material.healthRecords || []).length } };
 }
 
+// ════════════════════════════════════════════════════════════
+// Paramecium 移植 (2026-07-02)：L0 原文存档（装订工）
+// 算法逐字来自 paramecium/memory/archive-import.mjs，仅做平台必需转换：
+// node crypto → crypto.subtle（异步）、archive-state.json → D1 sync_state、
+// 磁盘 JSON 会话 → KV chat:*。切窗管道零 AI：机械分句、逐字原文、来源指针。
+// 存储分工：正文/FTS 在 D1（emet-mem），向量在 Vectorize（bge-m3 1024d），
+// Vectorize 只带轻 metadata（原文以 D1 为准，绕开 metadata 10KB 上限）。
+// ════════════════════════════════════════════════════════════
+const MEM2_SEG_MAX = 350;
+const MEM2_WIN_MAX = 700; // 原配方对着 bge-small-zh 512 token 定的；bge-m3 窗口更大，700 保持检索粒度不变
+const MEM2_USER_NAME = "静怡";
+const MEM2_ASSISTANT_NAME = "Emet";
+const MEM2_WINDOW_BUDGET = 300; // 单次 run 的切窗预算（控 subrequest 数），超了留给下一拍
+
+function mem2TextOf(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map(b => {
+      if (b && b.type === "text") return b.text || "";
+      if (b && b.type === "image") return "[图片]";
+      return "";
+    }).filter(Boolean).join("\n");
+  }
+  return "";
+}
+
+function mem2DateOf(ts, fallback) {
+  const d = ts ? new Date(ts) : (fallback ? new Date(fallback) : null);
+  if (!d || isNaN(d)) return "?";
+  return new Date(d.getTime() + 8 * 3600e3).toISOString().slice(0, 10); // Beijing
+}
+
+function mem2Segments(text) {
+  const sents = text.split(/(?<=[。！？!?；\n])/).map(s => s.trim()).filter(Boolean);
+  const segs = [];
+  let cur = "";
+  for (let s of sents) {
+    while (s.length > MEM2_SEG_MAX) { // run-on with no punctuation: hard split
+      if (cur) { segs.push(cur); cur = ""; }
+      segs.push(s.slice(0, MEM2_SEG_MAX));
+      s = s.slice(MEM2_SEG_MAX);
+    }
+    if (cur && cur.length + s.length > MEM2_SEG_MAX) { segs.push(cur); cur = s; }
+    else cur += s;
+  }
+  if (cur) segs.push(cur);
+  return segs;
+}
+
+async function mem2Sha1(s) {
+  const buf = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function mem2WindowsOf(conv) {
+  const title = (conv.title || "").replace(/\s+/g, " ").trim().slice(0, 50);
+  const flat = [];
+  for (const m of conv.messages || []) {
+    if (m.role !== "user" && m.role !== "assistant") continue;
+    if (m.distill) continue; // 沉淀汇报是派生文本，不是对话原文，不入档
+    const text = mem2TextOf(m.content).trim();
+    if (!text) continue;
+    const speaker = m.role === "user" ? MEM2_USER_NAME : MEM2_ASSISTANT_NAME;
+    const date = mem2DateOf(m.ts, conv.created_at);
+    for (const seg of mem2Segments(text)) flat.push({ speaker, date, seg });
+  }
+  const wins = [];
+  let i = 0;
+  while (i < flat.length) {
+    let len = 0, j = i;
+    const parts = [];
+    while (j < flat.length && (len === 0 || len + flat[j].seg.length <= MEM2_WIN_MAX)) {
+      parts.push(flat[j]); len += flat[j].seg.length; j++;
+    }
+    const lines = [];
+    let prevSpeaker = null;
+    for (const p of parts) {
+      if (p.speaker !== prevSpeaker) { lines.push(p.speaker + ": " + p.seg); prevSpeaker = p.speaker; }
+      else lines.push(p.seg);
+    }
+    const text = "[" + parts[0].date + " · " + title + "]\n" + lines.join("\n");
+    wins.push({
+      id: (await mem2Sha1(conv.id + ":" + i + ":" + text)).slice(0, 24),
+      text,
+      metadata: {
+        conv_id: conv.id, conv_title: title, date: parts[0].date,
+        date_int: parseInt(parts[0].date.replace(/-/g, ""), 10) || 0,
+        seg_start: i, seg_end: j - 1, layer: "archive"
+      }
+    });
+    if (j >= flat.length) break;
+    i = j - 1; // 1-segment overlap
+  }
+  return wins;
+}
+
+async function mem2EmbedBatch(env, texts) {
+  const out = [];
+  for (let i = 0; i < texts.length; i += 20) {
+    const r = await env.AI.run("@cf/baai/bge-m3", { text: texts.slice(i, i + 20) });
+    out.push(...(r?.data || []));
+  }
+  return out;
+}
+
+// 覆盖式重导一场会话（paramecium /archive-ingest 的 replace_conv 语义）：
+// Vectorize 不支持按 metadata 删 → 从 D1 拿旧窗口 id 列表按 id 批删
+async function mem2ImportConv(env, conv) {
+  const old = await env.DB.prepare("SELECT id FROM archive_windows WHERE conv_id = ?").bind(conv.id).all();
+  const oldIds = (old.results || []).map(r => r.id);
+  if (oldIds.length) await env.VEC.deleteByIds(oldIds);
+  const wins = await mem2WindowsOf(conv);
+  const stmts = [
+    env.DB.prepare("DELETE FROM archive_windows WHERE conv_id = ?").bind(conv.id),
+    env.DB.prepare("DELETE FROM raw WHERE source = 'chat' AND ref_id LIKE ?").bind(conv.id + ":%"),
+  ];
+  for (const w of wins) {
+    stmts.push(env.DB.prepare(
+      "INSERT INTO archive_windows (id, conv_id, title, date, date_int, seg_start, seg_end, text) VALUES (?,?,?,?,?,?,?,?)"
+    ).bind(w.id, w.metadata.conv_id, w.metadata.conv_title, w.metadata.date, w.metadata.date_int, w.metadata.seg_start, w.metadata.seg_end, w.text));
+  }
+  (conv.messages || []).forEach((m, idx) => {
+    if (m.role !== "user" && m.role !== "assistant") return;
+    if (m.distill) return;
+    const text = mem2TextOf(m.content).trim();
+    if (text.length < 2) return;
+    stmts.push(env.DB.prepare(
+      "INSERT INTO raw (content, source, ref_id, date, role) VALUES (?,?,?,?,?)"
+    ).bind(text, "chat", conv.id + ":" + idx, mem2DateOf(m.ts, conv.created_at), m.role));
+  });
+  for (let i = 0; i < stmts.length; i += 100) await env.DB.batch(stmts.slice(i, i + 100));
+  if (wins.length) {
+    const vecs = await mem2EmbedBatch(env, wins.map(w => w.text));
+    const points = wins.map((w, i) => ({
+      id: w.id, values: vecs[i],
+      metadata: { layer: "archive", conv_id: w.metadata.conv_id, title: w.metadata.conv_title, date: w.metadata.date, date_int: w.metadata.date_int }
+    })).filter(p => Array.isArray(p.values));
+    for (let i = 0; i < points.length; i += 100) await env.VEC.upsert(points.slice(i, i + 100));
+  }
+  return wins.length;
+}
+
+// 会话变更打脏标（chat PUT/sync/appendToActiveSession 三处调用），失败静默——同步主流程优先
+async function mem2MarkDirty(env, convId) {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO sync_state (key, value, updated_at) VALUES (?, '1', datetime('now')) ON CONFLICT(key) DO UPDATE SET value='1', updated_at=datetime('now')"
+    ).bind("dirty:" + convId).run();
+  } catch (e) { /* D1 抖动不能拖垮聊天同步 */ }
+}
+
+// 装订工主循环：只处理脏会话，消息数没变的跳过（archive:<id> 水位线），窗口预算防超限
+async function runArchiveImport(env) {
+  const dirty = await env.DB.prepare("SELECT key FROM sync_state WHERE key LIKE 'dirty:%' ORDER BY updated_at LIMIT 10").all();
+  const rows = dirty.results || [];
+  let imported = 0, windows = 0, skipped = 0;
+  for (const row of rows) {
+    if (windows >= MEM2_WINDOW_BUDGET) break;
+    const convId = row.key.slice(6);
+    const conv = await kvGet(env, "chat:" + convId);
+    if (!conv || conv.deleted) {
+      // 已删会话：连存档一起清（尊重删除意图）
+      const old = await env.DB.prepare("SELECT id FROM archive_windows WHERE conv_id = ?").bind(convId).all();
+      const oldIds = (old.results || []).map(r => r.id);
+      if (oldIds.length) await env.VEC.deleteByIds(oldIds);
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM archive_windows WHERE conv_id = ?").bind(convId),
+        env.DB.prepare("DELETE FROM raw WHERE source = 'chat' AND ref_id LIKE ?").bind(convId + ":%"),
+        env.DB.prepare("DELETE FROM sync_state WHERE key = ?").bind("archive:" + convId),
+        env.DB.prepare("DELETE FROM sync_state WHERE key = ?").bind(row.key),
+      ]);
+      continue;
+    }
+    const msgCount = (conv.messages || []).length;
+    const prev = await env.DB.prepare("SELECT value FROM sync_state WHERE key = ?").bind("archive:" + convId).first();
+    if (prev && String(prev.value) === String(msgCount)) {
+      await env.DB.prepare("DELETE FROM sync_state WHERE key = ?").bind(row.key).run();
+      skipped++;
+      continue;
+    }
+    const n = await mem2ImportConv(env, conv);
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')"
+      ).bind("archive:" + convId, String(msgCount)),
+      env.DB.prepare("DELETE FROM sync_state WHERE key = ?").bind(row.key),
+    ]);
+    imported++; windows += n;
+  }
+  const result = { imported, windows, skipped, pending_more: rows.length >= 10 || windows >= MEM2_WINDOW_BUDGET };
+  try {
+    await env.DB.prepare(
+      "INSERT INTO sync_state (key, value, updated_at) VALUES ('meta:l0-lastrun', ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')"
+    ).bind(JSON.stringify(result)).run();
+  } catch (e) {}
+  return result;
+}
+
+// 手写记忆 + 日记 → raw FTS（vault 行，exact 检索用；不进 Vectorize——它们已有 vec:* 向量，避免双重命中）
+async function mem2VaultSync(env) {
+  const mems = await kvListByPrefix(env, "mem:");
+  const diaries = await kvListByPrefix(env, "diary:");
+  const stmts = [env.DB.prepare("DELETE FROM raw WHERE source LIKE 'vault:%'")];
+  let count = 0;
+  for (const m of mems) {
+    const text = (m.content || "").trim();
+    if (text.length < 2) continue;
+    stmts.push(env.DB.prepare(
+      "INSERT INTO raw (content, source, ref_id, date, role) VALUES (?,?,?,?,?)"
+    ).bind(text, "vault:" + (m.category || "memory"), m.id, (m.created_at || "").slice(0, 10), ""));
+    count++;
+  }
+  for (const d of diaries) {
+    const text = (d.content || "").trim();
+    if (text.length < 2) continue;
+    stmts.push(env.DB.prepare(
+      "INSERT INTO raw (content, source, ref_id, date, role) VALUES (?,?,?,?,?)"
+    ).bind(text, "vault:diary", d.id, (d.diary_date || d.created_at || "").slice(0, 10), d.author || ""));
+    count++;
+  }
+  for (let i = 0; i < stmts.length; i += 100) await env.DB.batch(stmts.slice(i, i + 100));
+  return { vault_rows: count };
+}
+
+// ── 检索三件套（算法来自 paramecium memory-gateway.py，BM25→D1 FTS5 rank，Chroma→Vectorize）──
+// 阈值为 bge-m3 初步标定（2026-07-02 两组真实查询：相关 0.31-0.41、无关 ≥0.47），待更多样本细调
+const MEM2_MAX_DIST_ARCHIVE = 0.47; // archive 语义检索垃圾线（distance = 1 - 余弦相似度）
+const MEM2_HARD_DIST = 0.50;        // 注入 echo 道硬垃圾线
+const MEM2_REL_WINDOW = 0.12;       // 注入用户道相对过滤窗口（best + 0.12）
+const MEM2_RRF_K = 60;
+
+// CJK 感知 token 估算（paramecium count_tokens_cjk 原配方：CJK 1.5、其他 0.28）
+function mem2CountTokens(s) {
+  let t = 0;
+  for (const ch of String(s || "")) {
+    const c = ch.codePointAt(0);
+    t += (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3000 && c <= 0x30FF) ? 1.5 : 0.28;
+  }
+  return Math.round(t);
+}
+
+// L0 逐字检索（trigram 短语匹配，需≥3字；query 整体加引号防注入语法）
+async function mem2RawSearch(env, query, n) {
+  const safeQ = '"' + String(query || "").replace(/"/g, '""') + '"';
+  try {
+    const rs = await env.DB.prepare(
+      "SELECT content, source, ref_id, date, role FROM raw WHERE raw MATCH ? ORDER BY rank LIMIT ?"
+    ).bind(safeQ, Math.min(n || 8, 30)).all();
+    return (rs.results || []).map(r => ({
+      content: (r.content || "").slice(0, 600), source: r.source, ref_id: r.ref_id, date: r.date, role: r.role,
+    }));
+  } catch (e) { return []; }
+}
+
+// L0 语义检索：超采 3n → 垃圾线过滤（no hits beats garbage hits）→ per_conv 多样性上限
+async function mem2ArchiveSearch(env, { query, n = 5, max_distance, per_conv = 2, after, before, conv_id } = {}) {
+  n = Math.min(n || 5, 20);
+  const maxDist = typeof max_distance === "number" ? max_distance : MEM2_MAX_DIST_ARCHIVE;
+  const qv = await embedText(env, query);
+  if (!qv) return [];
+  const filter = { layer: "archive" };
+  if (conv_id) filter.conv_id = conv_id;
+  const df = {};
+  if (after) df["$gte"] = parseInt(String(after).replace(/-/g, ""), 10) || 0;
+  if (before) df["$lte"] = parseInt(String(before).replace(/-/g, ""), 10) || 99999999;
+  if (Object.keys(df).length) filter.date_int = df;
+  let matches = [];
+  try {
+    const res = await env.VEC.query(qv, { topK: Math.min(n * 3, 50), filter, returnMetadata: "none" });
+    matches = res?.matches || [];
+  } catch (e) { return []; }
+  if (!matches.length) return [];
+  const ph = matches.map(() => "?").join(",");
+  const rows = await env.DB.prepare(
+    `SELECT id, conv_id, title, date, text FROM archive_windows WHERE id IN (${ph})`
+  ).bind(...matches.map(m => m.id)).all();
+  const byId = new Map((rows.results || []).map(r => [r.id, r]));
+  const out = [], perConv = {};
+  for (const m of matches) {
+    const dist = 1 - (m.score || 0);
+    if (dist > maxDist) continue;
+    const w = byId.get(m.id);
+    if (!w) continue;
+    perConv[w.conv_id] = (perConv[w.conv_id] || 0) + 1;
+    if (perConv[w.conv_id] > per_conv) continue;
+    out.push({ document: w.text, metadata: { conv_id: w.conv_id, conv_title: w.title, date: w.date }, distance: Math.round(dist * 1000) / 1000 });
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
+// L1 混合检索：向量道（手写记忆 vec:* + 摘录 Vectorize layer=extract）+ FTS 道（raw vault 行）
+// RRF 融合（rank 1 → 1.0）→ 时效因子（60天常数、只占30%权重——旧记忆最多打七折不消失）
+// → access 对数加成（越被想起越容易再被想起，对数压制）。paramecium 4a 原配方。
+async function mem2SearchL1(env, query, n = 5, logAccess = true) {
+  n = Math.min(n || 5, 20);
+  const qv = await embedText(env, query);
+  const items = new Map(); // id → { id, date, category, document, dist, ftsRank, access }
+  // 向量道 A：手写记忆（现有 vec:* KV 暴力余弦，与 memory_search 同源）
+  const mems = await kvListByPrefix(env, "mem:");
+  const memById = new Map(mems.map(m => [m.id, m]));
+  if (qv) {
+    const scores = new Map();
+    for (const m of mems) {
+      try {
+        const raw = await env.MEMORY.get("vec:" + m.id);
+        if (raw) scores.set(m.id, cosineSim(qv, JSON.parse(raw)));
+      } catch (e) {}
+    }
+    for (const [id, sim] of scores) {
+      const m = memById.get(id);
+      if (!m) continue;
+      items.set(id, {
+        id, date: (m.created_at || "").slice(0, 10), category: m.category || "memory",
+        document: m.content || "", dist: 1 - sim, ftsRank: null, access: m.activations || 0, kind: "mem",
+      });
+    }
+    // 向量道 B：L1 摘录（Vectorize，superseded 过滤在 D1 侧）
+    try {
+      const res = await env.VEC.query(qv, { topK: Math.min(n * 3, 30), filter: { layer: "extract" }, returnMetadata: "none" });
+      const ms = res?.matches || [];
+      if (ms.length) {
+        const ph = ms.map(() => "?").join(",");
+        const rows = await env.DB.prepare(
+          `SELECT id, content, quote, date, conv_id, access_count FROM l1_memories WHERE id IN (${ph}) AND superseded_by = ''`
+        ).bind(...ms.map(m => m.id)).all();
+        const byId = new Map((rows.results || []).map(r => [r.id, r]));
+        for (const m of ms) {
+          const r = byId.get(m.id);
+          if (!r) continue;
+          items.set(r.id, {
+            id: r.id, date: r.date || "", category: "摘录", document: r.content,
+            quote: r.quote, conv_id: r.conv_id, dist: 1 - (m.score || 0), ftsRank: null, access: r.access_count || 0, kind: "extract",
+          });
+        }
+      }
+    } catch (e) {}
+  }
+  // FTS 道（替代 BM25：D1 FTS5 rank 直接喂 RRF）：vault 行 = 手写记忆 + 日记
+  try {
+    const safeQ = '"' + String(query || "").replace(/"/g, '""') + '"';
+    const fts = await env.DB.prepare(
+      "SELECT ref_id, content, source, date FROM raw WHERE raw MATCH ? AND source LIKE 'vault:%' ORDER BY rank LIMIT ?"
+    ).bind(safeQ, n * 3).all();
+    (fts.results || []).forEach((r, i) => {
+      const ex = items.get(r.ref_id);
+      if (ex) { ex.ftsRank = i + 1; return; }
+      const m = memById.get(r.ref_id);
+      items.set(r.ref_id, {
+        id: r.ref_id, date: r.date || "", category: r.source === "vault:diary" ? "日记" : (m?.category || r.source.slice(6)),
+        document: r.content || "", dist: null, ftsRank: i + 1, access: m?.activations || 0, kind: m ? "mem" : "diary",
+      });
+    });
+  } catch (e) {}
+  // RRF 融合 + 三因子排序（heat/tier 已在 paramecium 冻结出排序，不移植）
+  const vecRanked = [...items.values()].filter(x => x.dist !== null).sort((a, b) => a.dist - b.dist);
+  vecRanked.forEach((x, i) => { x.vecRank = i + 1; });
+  const nowMs = Date.now();
+  const scored = [...items.values()].map(x => {
+    const rrfV = x.vecRank ? (MEM2_RRF_K + 1) / (MEM2_RRF_K + x.vecRank) : 0;
+    const rrfB = x.ftsRank ? (MEM2_RRF_K + 1) / (MEM2_RRF_K + x.ftsRank) : 0;
+    const semantic = rrfV * 0.70 + rrfB * 0.30;
+    const ageDays = x.date ? Math.max(0, (nowMs - new Date(x.date).getTime()) / 86400000) : 0;
+    const recency = Math.exp(-ageDays / 60.0);
+    x.score = semantic * (0.7 + 0.3 * recency) * (1 + 0.05 * Math.log(1 + x.access));
+    return x;
+  }).sort((a, b) => b.score - a.score).slice(0, n);
+  // 计数规则：recall 触发的检索才算"被想起"（注入目录不算）
+  if (logAccess && scored.length) {
+    const logStmts = [];
+    for (const x of scored) {
+      logStmts.push(env.DB.prepare(
+        "INSERT INTO recall_log (memory_id, query, score, source) VALUES (?,?,?,?)"
+      ).bind(x.id, String(query || "").slice(0, 500), x.score, "search"));
+      if (x.kind === "extract") {
+        logStmts.push(env.DB.prepare(
+          "UPDATE l1_memories SET access_count = access_count + 1, last_accessed = datetime('now') WHERE id = ?"
+        ).bind(x.id));
+      } else if (x.kind === "mem") {
+        const m = memById.get(x.id);
+        if (m) { m.activations = (m.activations || 0) + 1; await kvPut(env, "mem:" + x.id, m); }
+      }
+    }
+    try { await env.DB.batch(logStmts); } catch (e) {}
+  }
+  return scored.map(x => ({
+    id: x.id, date: x.date, category: x.category, document: x.document,
+    quote: x.quote, conv_id: x.conv_id, distance: x.dist, score: Math.round(x.score * 1000) / 1000,
+  }));
+}
+
+// 目录注入（paramecium /inject 的 memory_index 部分）：一行一条只有标题，全文靠 recall 按需拉。
+// 用户道 n=5 相对距离过滤（自然句查询距离整体偏高，硬线会卡死注入——2026-06-10 教训）；
+// echo 道 n=3 只过硬线（"回复的余味"，两道互不设卡）；按 id 去重。注入一律不计 access。
+async function mem2BuildInjection(env, context, echo) {
+  const usr = await mem2SearchL1(env, context, 5, false);
+  const dists = usr.map(x => x.distance).filter(d => typeof d === "number");
+  const best = dists.length ? Math.min(...dists) : null;
+  const cut = best === null ? MEM2_HARD_DIST : Math.min(best + MEM2_REL_WINDOW, MEM2_HARD_DIST);
+  let hits = usr.filter(x => typeof x.distance === "number" ? x.distance < cut : x.score > 0); // FTS-only 命中保留（逐字匹配是强信号）
+  let echoHits = [];
+  if (echo && String(echo).trim()) {
+    const seen = new Set(hits.map(x => x.id));
+    echoHits = (await mem2SearchL1(env, String(echo).slice(0, 500), 3, false))
+      .filter(x => (typeof x.distance !== "number" || x.distance < MEM2_HARD_DIST) && !seen.has(x.id));
+  }
+  const lines = [...hits, ...echoHits].map(x => {
+    const tag = ((x.date || "") + " " + (x.category || "")).trim();
+    let summ = (x.document || "").replace(/\s+/g, " ");
+    if (summ.length > 60) summ = summ.slice(0, 60) + "…";
+    return "- [" + tag + "] " + summ;
+  });
+  const injection = lines.length ? "<memory_index>\n" + lines.join("\n") + "\n</memory_index>" : "";
+  return { injection, hits: hits.length, echo_hits: echoHits.length, token_estimate: mem2CountTokens(injection) };
+}
+
+// /api/mem2/* 子路由（鉴权在 routeRequest 统一做，checkMcpAuth 级别）
+async function handleMem2(request, env) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const method = request.method;
+  if (path === "/api/mem2/status" && method === "GET") {
+    const [wins, raws, l1, dirty, convs, lastrun] = await Promise.all([
+      env.DB.prepare("SELECT COUNT(*) AS c FROM archive_windows").first(),
+      env.DB.prepare("SELECT COUNT(*) AS c FROM raw").first(),
+      env.DB.prepare("SELECT COUNT(*) AS c FROM l1_memories WHERE superseded_by = ''").first(),
+      env.DB.prepare("SELECT COUNT(*) AS c FROM sync_state WHERE key LIKE 'dirty:%'").first(),
+      env.DB.prepare("SELECT COUNT(*) AS c FROM sync_state WHERE key LIKE 'archive:%'").first(),
+      env.DB.prepare("SELECT value, updated_at FROM sync_state WHERE key = 'meta:l0-lastrun'").first(),
+    ]);
+    return jsonResponse({
+      windows: wins?.c || 0, raw_rows: raws?.c || 0, l1_memories: l1?.c || 0,
+      dirty_pending: dirty?.c || 0, archived_convs: convs?.c || 0,
+      last_run: lastrun ? { at: lastrun.updated_at, ...JSON.parse(lastrun.value) } : null,
+    });
+  }
+  if (path === "/api/mem2/backfill" && method === "POST") {
+    // 只列键名不取值，把全部会话打脏，由 run/cron 分批消化
+    let cursor, marked = 0;
+    do {
+      const page = await env.MEMORY.list({ prefix: "chat:", cursor });
+      for (const k of page.keys) {
+        await mem2MarkDirty(env, k.name.slice(5));
+        marked++;
+      }
+      cursor = page.list_complete ? null : page.cursor;
+    } while (cursor);
+    return jsonResponse({ marked });
+  }
+  if (path === "/api/mem2/run" && method === "POST") {
+    return jsonResponse(await runArchiveImport(env));
+  }
+  if (path === "/api/mem2/vault-sync" && method === "POST") {
+    return jsonResponse(await mem2VaultSync(env));
+  }
+  if (path === "/api/mem2/raw-search" && method === "POST") {
+    const body = await request.json();
+    const results = await mem2RawSearch(env, body.query, body.n);
+    return jsonResponse({ results, count: results.length });
+  }
+  if (path === "/api/mem2/archive-search" && method === "POST") {
+    const body = await request.json();
+    const results = await mem2ArchiveSearch(env, body);
+    return jsonResponse({ results, count: results.length });
+  }
+  if (path === "/api/mem2/search" && method === "POST") {
+    const body = await request.json();
+    const results = await mem2SearchL1(env, body.query, body.n, body.boost_heat !== false);
+    return jsonResponse({ results, count: results.length });
+  }
+  if (path === "/api/mem2/inject" && method === "POST") {
+    const body = await request.json();
+    return jsonResponse(await mem2BuildInjection(env, String(body.context || ""), body.echo));
+  }
+  return jsonResponse({ error: "Not found" }, 404);
+}
+
 export default {
 async fetch(request, env, ctx) {
 const res = await routeRequest(request, env, ctx);
@@ -5967,6 +6447,7 @@ return;
 if (event.cron === "0,30 * * * *") {
 ctx.waitUntil(runHeartbeat(env));
 ctx.waitUntil(runKeepalive(env).catch(() => {})); // 缓存保活（与心跳互相独立，零副作用）
+ctx.waitUntil(runArchiveImport(env).catch(() => {})); // L0 装订工：只消化脏会话，无脏即空转
 // CN 22:30（UTC 14:30）那次顺便生成 daily 日记
 const cn = cnNow();
 if (cn.getUTCHours() === 14 && cn.getUTCMinutes() >= 30) {
@@ -6514,6 +6995,7 @@ messages: [...active.messages, msg],
 updated_at: ts,
 };
 await kvPut(env, "chat:" + active.id, updated);
+await mem2MarkDirty(env, active.id); // L0 装订工增量信号（心跳/凌晨守护消息也入档）
 return { ok: true, sessionId: active.id, mid: msg.mid };
 }
 
@@ -7218,10 +7700,11 @@ if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 
 return handlePush(request, env);
 }
 // ── 阶段 2：事件 + 凌晨守护配置（iOS Shortcut 用 ?key=，与 push 同级别）──
-if (path === "/api/events" || path.startsWith("/api/config/") || path.startsWith("/api/keepalive/")) {
+if (path === "/api/events" || path.startsWith("/api/config/") || path.startsWith("/api/keepalive/") || path.startsWith("/api/mem2/")) {
 if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
 if (path === "/api/events") return handleEvents(request, env);
 if (path.startsWith("/api/keepalive/")) return handleKeepalive(request, env);
+if (path.startsWith("/api/mem2/")) return handleMem2(request, env);
 return handleConfig(request, env);
 }
 // ── 阶段 3 admin：手动触发周记 / 月记生成（测试 + 手动补写）──
