@@ -5966,6 +5966,7 @@ return;
 // 每 30 分钟（UTC 0 / 30 分）→ 心跳：按概率判断要不要主动找静怡
 if (event.cron === "0,30 * * * *") {
 ctx.waitUntil(runHeartbeat(env));
+ctx.waitUntil(runKeepalive(env).catch(() => {})); // 缓存保活（与心跳互相独立，零副作用）
 // CN 22:30（UTC 14:30）那次顺便生成 daily 日记
 const cn = cnNow();
 if (cn.getUTCHours() === 14 && cn.getUTCMinutes() >= 30) {
@@ -6329,6 +6330,13 @@ function defaultHeartbeatConfig() {
 return {
 enabled: false,      // 默认关闭，前端开关显式开启
 cooldown_min: 120,   // 2 小时冷却
+};
+}
+
+// 默认 keepalive（缓存保活）配置（KV 无值时返回这个，不写回）
+function defaultKeepaliveConfig() {
+return {
+enabled: false, // 默认关闭，前端开关显式开启（开启后按拍重放会花钱）
 };
 }
 
@@ -7004,6 +7012,179 @@ return jsonResponse({ success: true, config: cfg });
 return jsonResponse({ error: "method not allowed" }, 405);
 }
 
+if (path === "/api/config/keepalive") {
+if (method === "GET") {
+const cfg = (await kvGet(env, "config:keepalive")) || defaultKeepaliveConfig();
+return jsonResponse({ config: cfg });
+}
+if (method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+if (typeof body?.enabled !== "boolean") return jsonResponse({ error: "enabled must be boolean" }, 400);
+const cfg = { enabled: body.enabled };
+await kvPut(env, "config:keepalive", cfg);
+return jsonResponse({ success: true, config: cfg });
+}
+return jsonResponse({ error: "method not allowed" }, 405);
+}
+
+return jsonResponse({ error: "Not found" }, 404);
+}
+
+// ════════════════════════════════════════════════════════════
+// 缓存保活（keepalive）：重放前端上传的"请求快照"，免费续期 Anthropic prompt cache
+// 与"心跳系统"(heartbeat=主动消息)完全独立：不写会话、不发推送、零副作用。
+// KV：config:keepalive → {enabled}；keepalive:snapshot → 前端每轮聊天成功后覆盖；
+//     keepalive:lastBeat → ISO；keepalive:state → 熔断状态；keepalive:log:<ts> → 单拍结果(7天过期)
+// 安全边界：快照不含 apiKey（重放时按 providerId 从 settings:global 现查）；日志只记 usage 数字。
+// ════════════════════════════════════════════════════════════
+
+const KEEPALIVE_MIN_GAP_MIN = 25; // 30 分钟 cron 网格上 = 每 30 分钟一拍。严禁 31-59（会折算成 60 分钟节拍，踩 1h TTL 悬崖 → 拍拍全量重写）
+const KEEPALIVE_MAX_AGE_H = 5;    // 距最后一次聊天超 5 小时停拍（人不在，别白烧）
+
+async function runKeepalive(env) {
+const cfg = (await kvGet(env, "config:keepalive")) || defaultKeepaliveConfig();
+if (!cfg.enabled) return { skipped: "disabled" };
+
+// 时段闸门：东八区 8:00–22:30。22:30 后停拍：每天 22:30 自动日记会改变 system 的日记摘要段，
+// 前缀必变 → 跨夜保活暖的是死前缀。次日首聊注定重建一次，认了。
+const cn = cnNow();
+const h = cn.getUTCHours(), mi = cn.getUTCMinutes();
+if (h < 8 || h > 22 || (h === 22 && mi >= 30)) return { skipped: "sleep-window" };
+
+const state = (await kvGet(env, "keepalive:state")) || { consecErrors: 0, consecBadCache: 0, pausedReason: null, maxTokensOne: false };
+if (state.pausedReason) return { skipped: "paused", reason: state.pausedReason };
+
+const snap = await kvGet(env, "keepalive:snapshot");
+if (!snap || !snap.savedAt || !Array.isArray(snap.messages) || !snap.messages.length) return { skipped: "no-snapshot" };
+
+// 快照必须是"当天"（东八区）且 5 小时内
+const ageMs = Date.now() - new Date(snap.savedAt).getTime();
+const snapCnDay = new Date(new Date(snap.savedAt).getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+if (snapCnDay !== cn.toISOString().slice(0, 10)) return { skipped: "stale-day" };
+if (ageMs > KEEPALIVE_MAX_AGE_H * 3600 * 1000) return { skipped: "stale-age" };
+
+// 供应商/模型未切换才有意义（缓存按模型隔离，暖旧模型 = 白烧）
+const settings = await kvGet(env, "settings:global");
+const p = (settings?.providers || []).find((x) => x.id === snap.providerId);
+if (!p || !p.enabled || !p.apiKey || (p.protocol || "anthropic") !== "anthropic") return { skipped: "provider-gone" };
+if (settings?.chatTarget?.providerId !== snap.providerId || settings?.chatTarget?.model !== snap.model) return { skipped: "target-switched" };
+
+// 节拍闸门：距上次聊天/上拍 ≥ 25 分钟
+const lastBeatIso = await env.MEMORY.get("keepalive:lastBeat");
+const lastActive = Math.max(new Date(snap.savedAt).getTime(), lastBeatIso ? new Date(lastBeatIso).getTime() : 0);
+if (Date.now() - lastActive < KEEPALIVE_MIN_GAP_MIN * 60 * 1000) return { skipped: "recent" };
+
+// ── 重放：末条消息换短 nonce（击穿网关响应缓存 + 省尾部计费 + 规避陈旧时间戳）；
+//    倒数第二条（带 BP4 断点）及之前的前缀逐字不动 → 命中并免费续期同一批缓存条目
+const messages = snap.messages.slice(0, -1);
+messages.push({ role: "user", content: "（保活 " + Date.now() + "）" });
+let base = (p.baseUrl || "").replace(/\/+$/, "");
+if (!/\/v1$/.test(base)) base += "/v1";
+const body = { model: snap.model, max_tokens: state.maxTokensOne ? 1 : 0, stream: false, messages };
+if (snap.system) body.system = snap.system;
+if (Array.isArray(snap.tools) && snap.tools.length) body.tools = snap.tools;
+const headers = { "x-api-key": p.apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" };
+
+const ts = now();
+const t0 = Date.now();
+let usage = null, err = null;
+try {
+let resp = await fetch(base + "/messages", { method: "POST", headers, body: JSON.stringify(body) });
+// 部分中转不认 max_tokens:0（官方预热用法）→ 降级为 1 并记住
+if (resp.status === 400 && !state.maxTokensOne) {
+const t = await resp.text().catch(() => "");
+if (/max_tokens/i.test(t)) {
+state.maxTokensOne = true;
+body.max_tokens = 1;
+resp = await fetch(base + "/messages", { method: "POST", headers, body: JSON.stringify(body) });
+} else {
+throw new Error(`400: ${t.slice(0, 200)}`);
+}
+}
+if (!resp.ok) {
+const t = await resp.text().catch(() => "");
+throw new Error(`${resp.status}: ${t.slice(0, 200)}`);
+}
+const data = await resp.json();
+usage = data?.usage || null;
+} catch (e) {
+err = String(e?.message || e).slice(0, 200);
+}
+
+// ── 熔断与记账：读>0=在省钱；写≈0=没在烧；连续异常自动停，最坏损失封顶两拍 ──
+if (err) {
+state.consecErrors = (state.consecErrors || 0) + 1;
+if (state.consecErrors >= 3) state.pausedReason = "连续失败 3 次，已暂停（下次聊天自动恢复）";
+} else {
+state.consecErrors = 0;
+const read = usage?.cache_read_input_tokens || 0;
+const write = usage?.cache_creation_input_tokens || 0;
+if (write > 1000 || (read === 0 && write === 0)) state.consecBadCache = (state.consecBadCache || 0) + 1;
+else state.consecBadCache = 0;
+if (state.consecBadCache >= 2) state.pausedReason = "连续未命中缓存（在重写或缓存标记被剥离），已暂停（下次聊天自动恢复）";
+await env.MEMORY.put("keepalive:lastBeat", ts);
+}
+await kvPut(env, "keepalive:state", state);
+await env.MEMORY.put(`keepalive:log:${ts}`, JSON.stringify({
+ts, ok: !err, ms: Date.now() - t0, err: err || undefined,
+read: usage?.cache_read_input_tokens ?? null,
+write: usage?.cache_creation_input_tokens ?? null,
+input: usage?.input_tokens ?? null,
+output: usage?.output_tokens ?? null,
+}), { expirationTtl: 7 * 24 * 3600 });
+return { ok: !err, err: err || undefined, usage };
+}
+
+// keepalive 路由：POST /api/keepalive/snapshot（前端每轮聊天成功后上报）+ GET /api/keepalive/status（设置页状态行）
+async function handleKeepalive(request, env) {
+const url = new URL(request.url);
+const path = url.pathname;
+if (path === "/api/keepalive/snapshot" && request.method === "POST") {
+let body;
+try { body = await request.json(); } catch { return jsonResponse({ error: "invalid json" }, 400); }
+if (!body?.providerId || !body?.model || !Array.isArray(body?.messages) || !body.messages.length) {
+return jsonResponse({ error: "providerId/model/messages required" }, 400);
+}
+const snap = {
+providerId: body.providerId,
+model: body.model,
+system: body.system,
+tools: body.tools,
+messages: body.messages,
+savedAt: body.savedAt || now(),
+}; // 红线：不接收/不存 apiKey
+await kvPut(env, "keepalive:snapshot", snap);
+// 新快照 = 新起点：清熔断计数（保留 maxTokensOne 的降级记忆）
+const prev = (await kvGet(env, "keepalive:state")) || {};
+await kvPut(env, "keepalive:state", { consecErrors: 0, consecBadCache: 0, pausedReason: null, maxTokensOne: !!prev.maxTokensOne });
+return jsonResponse({ success: true, savedAt: snap.savedAt });
+}
+if (path === "/api/keepalive/status" && request.method === "GET") {
+const cfg = (await kvGet(env, "config:keepalive")) || defaultKeepaliveConfig();
+const state = (await kvGet(env, "keepalive:state")) || null;
+const snap = await kvGet(env, "keepalive:snapshot");
+const lastBeat = await env.MEMORY.get("keepalive:lastBeat");
+const list = await env.MEMORY.list({ prefix: "keepalive:log:" });
+const keys = list.keys.sort((a, b) => b.name.localeCompare(a.name)).slice(0, 30);
+const logs = [];
+for (const k of keys) {
+const raw = await env.MEMORY.get(k.name);
+if (raw) logs.push(JSON.parse(raw));
+}
+const cnDay = cnNow().toISOString().slice(0, 10);
+const today = logs.filter((l) => new Date(new Date(l.ts).getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10) === cnDay);
+const sum = (arr, f) => arr.reduce((a, x) => a + (x[f] || 0), 0);
+return jsonResponse({
+config: cfg,
+paused: state?.pausedReason || null,
+lastBeat: lastBeat || null,
+snapshot: snap ? { savedAt: snap.savedAt, model: snap.model, providerId: snap.providerId } : null,
+today: { beats: today.filter((l) => l.ok).length, errors: today.filter((l) => !l.ok).length, read: sum(today, "read"), write: sum(today, "write") },
+recent: logs.slice(0, 5),
+});
+}
 return jsonResponse({ error: "Not found" }, 404);
 }
 
@@ -7037,9 +7218,10 @@ if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 
 return handlePush(request, env);
 }
 // ── 阶段 2：事件 + 凌晨守护配置（iOS Shortcut 用 ?key=，与 push 同级别）──
-if (path === "/api/events" || path.startsWith("/api/config/")) {
+if (path === "/api/events" || path.startsWith("/api/config/") || path.startsWith("/api/keepalive/")) {
 if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
 if (path === "/api/events") return handleEvents(request, env);
+if (path.startsWith("/api/keepalive/")) return handleKeepalive(request, env);
 return handleConfig(request, env);
 }
 // ── 阶段 3 admin：手动触发周记 / 月记生成（测试 + 手动补写）──
