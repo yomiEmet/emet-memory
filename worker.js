@@ -577,10 +577,11 @@ arousal: { type: "number", minimum: 0, maximum: 1, default: 0.5 },
 valence: { type: "number", minimum: -1, maximum: 1, default: 0 },
 tags: { type: "string", default: "" }
 }, required: ["content"] } },
-{ name: "memory_search", description: "搜索记忆。",
+{ name: "memory_search", description: "搜索记忆。默认语义检索（相似度+重要度加权，低权重的技术细节可能被挤出结果）；exact=true 改走精确关键词匹配——query按空格拆词、每个词都逐字命中(内容或标签)才返回，按词频+新近度排序，找端口号/配置/特定原词用这个。category 可限定分类。",
 inputSchema: { type: "object", properties: {
 query: { type: "string" },
 category: { type: "string", enum: ["core","scene","emotion","semantic","image","procedure","all"], default: "all" },
+exact: { type: "boolean", description: "true=精确关键词匹配(全部词逐字命中,不做语义/重要度加权)；省略=语义检索" },
 limit: { type: "number", default: 10 }
 }, required: ["query"] } },
 // Paramecium 移植：recall 工具（定义随 tools 进缓存前缀，措辞改动=全量缓存作废，改前三思）
@@ -850,6 +851,39 @@ return { success: true, id, message: `记忆已保存：${args.content.substring
 }
 case "memory_search": {
 const all = await kvListByPrefix(env, "mem:");
+
+// ── 精确关键词模式（2026-07 加）──
+// 逐字全命中才返回，完全绕开语义相似+importance 加权——修复 6.11 实测的
+// 「搜 proxy 7897 被封号相关高权重记忆淹没」：低权重技术记忆有了直达通道。
+// 不走藤蔓扩展（要的就是精确），命中同样算召回 +1 activations。
+if (args.exact) {
+const terms = String(args.query || "").toLowerCase().split(/\s+/).filter(Boolean);
+if (!terms.length) return { error: "query required" };
+let pool = all.filter(m => !m.archived);
+if (args.category && args.category !== "all") pool = pool.filter(m => m.category === args.category);
+const hits = [];
+for (const m of pool) {
+const hay = ((m.content || "") + " " + (Array.isArray(m.tags) ? m.tags.join(" ") : "")).toLowerCase();
+if (!terms.every(t => hay.includes(t))) continue;
+let freq = 0;
+for (const t of terms) { let i = -1; while ((i = hay.indexOf(t, i + 1)) !== -1) freq++; }
+hits.push({ m, freq });
+}
+hits.sort((a, b) => b.freq - a.freq || new Date(b.m.created_at) - new Date(a.m.created_at));
+const exactOut = hits.slice(0, args.limit || 10).map(h => h.m);
+for (const m of exactOut) {
+m.activations = (m.activations || 0) + 1;
+m.updated_at = now();
+const { _scoreA, ...toSave } = m;
+await kvPut(env, `mem:${m.id}`, toSave);
+}
+return {
+results: exactOut.map(({ _scoreA, ...clean }) => clean),
+count: exactOut.length,
+mode: "exact"
+};
+}
+
 const filtered = await searchA(env, args.query || "", all, {
 limit: args.limit || 10,
 category: args.category
@@ -6070,6 +6104,21 @@ async function mem2WindowsOf(conv) {
   return wins;
 }
 
+// 按负载大小打包 D1 batch：≤400 条且 ≤700KB 一批——批数（=调用数）随内容体积自适应，
+// 而不是随行数线性增长（4000 条消息的怪物对话固定 100 条/批会切出 50+ 批，爆掉单次调用预算）
+async function mem2BatchBySize(env, stmts, sizes) {
+  let start = 0, load = 0;
+  for (let i = 0; i < stmts.length; i++) {
+    const s = sizes[i] || 200;
+    if (i > start && (i - start >= 400 || load + s > 700000)) {
+      await env.DB.batch(stmts.slice(start, i));
+      start = i; load = 0;
+    }
+    load += s;
+  }
+  if (start < stmts.length) await env.DB.batch(stmts.slice(start));
+}
+
 async function mem2EmbedBatch(env, texts) {
   const out = [];
   for (let i = 0; i < texts.length; i += 20) {
@@ -6092,10 +6141,12 @@ async function mem2ImportConv(env, conv, sourceTag = "chat", skipVectors = false
     env.DB.prepare("DELETE FROM archive_windows WHERE conv_id = ?").bind(conv.id),
     env.DB.prepare("DELETE FROM raw WHERE source = ? AND ref_id LIKE ?").bind(sourceTag, conv.id + ":%"),
   ];
+  const sizes = [50, 50]; // 按语句负载大小打包批次（怪物对话按固定100条切会切出50+批爆调用预算）
   for (const w of wins) {
     stmts.push(env.DB.prepare(
       "INSERT INTO archive_windows (id, conv_id, title, date, date_int, seg_start, seg_end, text) VALUES (?,?,?,?,?,?,?,?)"
     ).bind(w.id, w.metadata.conv_id, w.metadata.conv_title, w.metadata.date, w.metadata.date_int, w.metadata.seg_start, w.metadata.seg_end, w.text));
+    sizes.push(w.text.length + 120);
   }
   (conv.messages || []).forEach((m, idx) => {
     if (m.role !== "user" && m.role !== "assistant") return;
@@ -6105,12 +6156,14 @@ async function mem2ImportConv(env, conv, sourceTag = "chat", skipVectors = false
     // 巨型消息（官方端贴长文档）按 8K 字切行：单条 15 万字的 trigram 索引会把 D1 一条 INSERT 打爆（实测 1101）
     const date = mem2DateOf(m.ts, conv.created_at);
     for (let p = 0; p * 8000 < text.length; p++) {
+      const piece = text.slice(p * 8000, (p + 1) * 8000);
       stmts.push(env.DB.prepare(
         "INSERT INTO raw (content, source, ref_id, date, role) VALUES (?,?,?,?,?)"
-      ).bind(text.slice(p * 8000, (p + 1) * 8000), sourceTag, conv.id + ":" + idx + (p ? ":" + p : ""), date, m.role));
+      ).bind(piece, sourceTag, conv.id + ":" + idx + (p ? ":" + p : ""), date, m.role));
+      sizes.push(piece.length + 120);
     }
   });
-  for (let i = 0; i < stmts.length; i += 100) await env.DB.batch(stmts.slice(i, i + 100));
+  await mem2BatchBySize(env, stmts, sizes);
   if (wins.length && !skipVectors) {
     if (wins.length <= MEM2_VEC_INLINE_MAX) {
       const vecs = await mem2EmbedBatch(env, wins.map(w => w.text));
@@ -6889,10 +6942,19 @@ return;
 if (event.cron === "0,30 * * * *") {
 ctx.waitUntil(runHeartbeat(env));
 ctx.waitUntil(runKeepalive(env).catch(() => {})); // 缓存保活（与心跳互相独立，零副作用）
-ctx.waitUntil(runArchiveImport(env).catch(() => {})); // L0 装订工：只消化脏会话，无脏即空转
-ctx.waitUntil(runOfficialImport(env).catch(() => {})); // 官方档案装订工：消化 offdirty 信号，无脏即空转
-ctx.waitUntil(mem2ProcessVecQueue(env).catch(() => {})); // 大对话向量补录队列：每拍 200 窗，无队即空转
-ctx.waitUntil(runExtraction(env).catch(() => {})); // L1 摘录员：默认关（config:extraction），关着时只清信号队列
+// 记忆类任务串行 + 按拍错峰：全并发时官方档案积压会挤爆单次调用的资源预算，
+// 整拍被无声掐死（2026-07-03 实测：卡死 16 小时，meta 停更）。
+// :00 拍 = L0 装订工 + 官方档案导入；:30 拍 = 向量补录 + L1 摘录。
+ctx.waitUntil((async () => {
+  const min = new Date().getUTCMinutes();
+  if (min < 15) {
+    await runArchiveImport(env).catch(() => {});
+    await runOfficialImport(env).catch(() => {});
+  } else {
+    await mem2ProcessVecQueue(env).catch(() => {});
+    await runExtraction(env).catch(() => {});
+  }
+})());
 // CN 22:30（UTC 14:30）那次顺便生成 daily 日记
 const cn = cnNow();
 if (cn.getUTCHours() === 14 && cn.getUTCMinutes() >= 30) {
