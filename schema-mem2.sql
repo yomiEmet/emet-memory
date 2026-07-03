@@ -54,4 +54,22 @@ CREATE TABLE IF NOT EXISTS recall_log (
 );
 CREATE INDEX IF NOT EXISTS idx_recall_memory ON recall_log(memory_id);
 
+-- 官方档案本体（claude.ai 导出太大进不了 KV 25MB 单值：按对话分片存 D1，5GB 免费额度）
+-- 前端上传时按场分片写入；档案室阅读按需取单场；装订工按 offdirty 信号增量入档
+CREATE TABLE IF NOT EXISTS official_convs (
+  uuid TEXT PRIMARY KEY,
+  name TEXT DEFAULT '',
+  updated_at TEXT DEFAULT '',
+  msg_count INTEGER DEFAULT 0,
+  chunk_count INTEGER DEFAULT 0,
+  bytes INTEGER DEFAULT 0,
+  saved_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS official_conv_chunks (
+  uuid TEXT NOT NULL,
+  idx INTEGER NOT NULL,
+  data TEXT NOT NULL,
+  PRIMARY KEY (uuid, idx)
+);
+
 DROP TABLE IF EXISTS fts_test;

@@ -6086,7 +6086,7 @@ async function mem2EmbedBatch(env, texts) {
 async function mem2ImportConv(env, conv, sourceTag = "chat", skipVectors = false) {
   const old = await env.DB.prepare("SELECT id FROM archive_windows WHERE conv_id = ?").bind(conv.id).all();
   const oldIds = (old.results || []).map(r => r.id);
-  if (oldIds.length) await env.VEC.deleteByIds(oldIds);
+  for (let i = 0; i < oldIds.length; i += 100) await env.VEC.deleteByIds(oldIds.slice(i, i + 100)); // deleteByIds 上限 100/次
   const wins = await mem2WindowsOf(conv);
   const stmts = [
     env.DB.prepare("DELETE FROM archive_windows WHERE conv_id = ?").bind(conv.id),
@@ -6102,20 +6102,73 @@ async function mem2ImportConv(env, conv, sourceTag = "chat", skipVectors = false
     if (m.distill) return;
     const text = mem2TextOf(m.content).trim();
     if (text.length < 2) return;
-    stmts.push(env.DB.prepare(
-      "INSERT INTO raw (content, source, ref_id, date, role) VALUES (?,?,?,?,?)"
-    ).bind(text, sourceTag, conv.id + ":" + idx, mem2DateOf(m.ts, conv.created_at), m.role));
+    // 巨型消息（官方端贴长文档）按 8K 字切行：单条 15 万字的 trigram 索引会把 D1 一条 INSERT 打爆（实测 1101）
+    const date = mem2DateOf(m.ts, conv.created_at);
+    for (let p = 0; p * 8000 < text.length; p++) {
+      stmts.push(env.DB.prepare(
+        "INSERT INTO raw (content, source, ref_id, date, role) VALUES (?,?,?,?,?)"
+      ).bind(text.slice(p * 8000, (p + 1) * 8000), sourceTag, conv.id + ":" + idx + (p ? ":" + p : ""), date, m.role));
+    }
   });
   for (let i = 0; i < stmts.length; i += 100) await env.DB.batch(stmts.slice(i, i + 100));
   if (wins.length && !skipVectors) {
-    const vecs = await mem2EmbedBatch(env, wins.map(w => w.text));
-    const points = wins.map((w, i) => ({
-      id: w.id, values: vecs[i],
-      metadata: { layer: "archive", conv_id: w.metadata.conv_id, title: w.metadata.conv_title, date: w.metadata.date, date_int: w.metadata.date_int }
-    })).filter(p => Array.isArray(p.values));
-    for (let i = 0; i < points.length; i += 100) await env.VEC.upsert(points.slice(i, i + 100));
+    if (wins.length <= MEM2_VEC_INLINE_MAX) {
+      const vecs = await mem2EmbedBatch(env, wins.map(w => w.text));
+      const points = wins.map((w, i) => ({
+        id: w.id, values: vecs[i],
+        metadata: { layer: "archive", conv_id: w.metadata.conv_id, title: w.metadata.conv_title, date: w.metadata.date, date_int: w.metadata.date_int }
+      })).filter(p => Array.isArray(p.values));
+      for (let i = 0; i < points.length; i += 100) await env.VEC.upsert(points.slice(i, i + 100));
+    } else {
+      // 大对话（如官方端超长会话）一次调用向量化会打爆资源限制（实测 850 窗 1101）：
+      // 正文/FTS 已入库先可检索，向量排队（vecq:）由后续每拍分批补齐
+      await env.DB.prepare(
+        "INSERT INTO sync_state (key, value, updated_at) VALUES (?, '0', datetime('now')) ON CONFLICT(key) DO UPDATE SET value='0', updated_at=datetime('now')"
+      ).bind("vecq:" + conv.id).run();
+    }
   }
   return wins.length;
+}
+
+const MEM2_VEC_INLINE_MAX = 120;  // 小于这个窗口数就地向量化（一次调用装得下）
+const MEM2_VEC_PER_RUN = 200;     // 每拍补录的窗口预算
+
+// 向量补录队列：大对话的窗口按 OFFSET 游标分批 embed+upsert，补完销号
+async function mem2ProcessVecQueue(env) {
+  const q = await env.DB.prepare(
+    "SELECT key, value FROM sync_state WHERE key LIKE 'vecq:%' ORDER BY updated_at LIMIT 3"
+  ).all();
+  const rows = q.results || [];
+  let processed = 0;
+  for (const row of rows) {
+    if (processed >= MEM2_VEC_PER_RUN) break;
+    const convId = row.key.slice(5);
+    const offset = parseInt(row.value, 10) || 0;
+    const take = MEM2_VEC_PER_RUN - processed;
+    const wins = await env.DB.prepare(
+      "SELECT id, conv_id, title, date, date_int, text FROM archive_windows WHERE conv_id = ? ORDER BY seg_start LIMIT ? OFFSET ?"
+    ).bind(convId, take, offset).all();
+    const ws = wins.results || [];
+    if (!ws.length) {
+      await env.DB.prepare("DELETE FROM sync_state WHERE key = ?").bind(row.key).run();
+      continue;
+    }
+    const vecs = await mem2EmbedBatch(env, ws.map(w => w.text));
+    const points = ws.map((w, i) => ({
+      id: w.id, values: vecs[i],
+      metadata: { layer: "archive", conv_id: w.conv_id, title: w.title, date: w.date, date_int: w.date_int }
+    })).filter(p => Array.isArray(p.values));
+    for (let i = 0; i < points.length; i += 100) await env.VEC.upsert(points.slice(i, i + 100));
+    processed += ws.length;
+    if (ws.length < take) {
+      await env.DB.prepare("DELETE FROM sync_state WHERE key = ?").bind(row.key).run(); // 补完销号
+    } else {
+      await env.DB.prepare(
+        "INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')"
+      ).bind(row.key, String(offset + ws.length)).run();
+    }
+  }
+  return processed;
 }
 
 // 会话变更打脏标（chat PUT/sync/appendToActiveSession 三处调用），失败静默——同步主流程优先
@@ -6146,7 +6199,7 @@ async function runArchiveImport(env) {
       // 已删会话：连存档一起清（尊重删除意图）
       const old = await env.DB.prepare("SELECT id FROM archive_windows WHERE conv_id = ?").bind(convId).all();
       const oldIds = (old.results || []).map(r => r.id);
-      if (oldIds.length) await env.VEC.deleteByIds(oldIds);
+      for (let i = 0; i < oldIds.length; i += 100) await env.VEC.deleteByIds(oldIds.slice(i, i + 100)); // deleteByIds 上限 100/次
       await env.DB.batch([
         env.DB.prepare("DELETE FROM archive_windows WHERE conv_id = ?").bind(convId),
         env.DB.prepare("DELETE FROM raw WHERE source = 'chat' AND ref_id LIKE ?").bind(convId + ":%"),
@@ -6187,12 +6240,22 @@ async function runArchiveImport(env) {
 const MEM2_VEC_BUDGET = 4500; // 向量容量安全线（免费额度 ~4880，给 L1 摘录留余量）
 
 function mem2NormalizeOfficialConv(c) {
+  // 两种输入都认：claude.ai 原始导出（chat_messages/sender/text）
+  // 和档案室规范化格式（messages[].role='human'|'assistant', blocks[{type,text}]）。
+  // 入档只取 text 块（对话原文）——thinking/工具块是内部过程，不是"说过的话"。
   const msgs = (c.chat_messages || c.messages || []).map(m => {
     let content = m.text;
+    if (!content && Array.isArray(m.blocks)) {
+      content = m.blocks.map(b => {
+        if (b?.type === "text") return b.text || "";
+        if (b?.type === "image") return "[图片]";
+        return "";
+      }).filter(Boolean).join("\n");
+    }
     if (!content && Array.isArray(m.content)) content = m.content.map(b => b?.text || "").filter(Boolean).join("\n");
     if (!content && typeof m.content === "string") content = m.content;
     return {
-      role: (m.sender === "human" || m.role === "user") ? "user" : "assistant",
+      role: (m.sender === "human" || m.role === "human" || m.role === "user") ? "user" : "assistant",
       content: content || "",
       ts: m.created_at || m.timestamp || null,
     };
@@ -6205,6 +6268,43 @@ function mem2NormalizeOfficialConv(c) {
   };
 }
 
+// 官方档案本体读写（D1 分片，见 schema-mem2.sql official_convs/official_conv_chunks）
+const MEM2_OFF_CHUNK = 250000; // 每片字符数（UTF-8 最坏 3 字节/字 ≈ 750KB，稳在 D1 参数限制内）
+
+async function mem2LoadOfficialConv(env, uuid) {
+  const rs = await env.DB.prepare(
+    "SELECT data FROM official_conv_chunks WHERE uuid = ? ORDER BY idx"
+  ).bind(uuid).all();
+  const rows = rs.results || [];
+  if (!rows.length) return null;
+  try { return JSON.parse(rows.map(r => r.data).join("")); } catch (e) { return null; }
+}
+
+async function mem2StoreOfficialConv(env, c) {
+  const uuid = c.uuid || c.id;
+  if (!uuid) return "skipped";
+  const msgCount = (c.messages || c.chat_messages || []).length;
+  const json = JSON.stringify(c);
+  const prev = await env.DB.prepare("SELECT msg_count, bytes FROM official_convs WHERE uuid = ?").bind(uuid).first();
+  if (prev && prev.msg_count === msgCount && prev.bytes === json.length) return "skipped"; // 没变不重写
+  const stmts = [env.DB.prepare("DELETE FROM official_conv_chunks WHERE uuid = ?").bind(uuid)];
+  let idx = 0;
+  for (let i = 0; i < json.length; i += MEM2_OFF_CHUNK) {
+    stmts.push(env.DB.prepare(
+      "INSERT INTO official_conv_chunks (uuid, idx, data) VALUES (?,?,?)"
+    ).bind(uuid, idx++, json.slice(i, i + MEM2_OFF_CHUNK)));
+  }
+  stmts.push(env.DB.prepare(
+    "INSERT INTO official_convs (uuid, name, updated_at, msg_count, chunk_count, bytes, saved_at) VALUES (?,?,?,?,?,?,datetime('now')) " +
+    "ON CONFLICT(uuid) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at, msg_count=excluded.msg_count, chunk_count=excluded.chunk_count, bytes=excluded.bytes, saved_at=datetime('now')"
+  ).bind(uuid, String(c.name || c.title || "").slice(0, 100), c.updated_at || "", msgCount, idx, json.length));
+  stmts.push(env.DB.prepare(
+    "INSERT INTO sync_state (key, value, updated_at) VALUES (?, '1', datetime('now')) ON CONFLICT(key) DO UPDATE SET value='1', updated_at=datetime('now')"
+  ).bind("offdirty:official:" + uuid));
+  for (let i = 0; i < stmts.length; i += 100) await env.DB.batch(stmts.slice(i, i + 100));
+  return "stored";
+}
+
 // archive:data 变更后调用：对比每场官方对话的消息数水位线，变了的打 offdirty 信号
 async function mem2MarkOfficialDirty(env, blob) {
   try {
@@ -6215,6 +6315,8 @@ async function mem2MarkOfficialDirty(env, blob) {
     for (const r of rs.results || []) known.set(r.key.slice(8), r.value);
     const stmts = [];
     for (const c of convs) {
+      // 轻量目录条目（无消息数组）不打信号——对话本体走 official-upload 分片通道
+      if (!Array.isArray(c.chat_messages) && !Array.isArray(c.messages)) continue;
       const id = "official:" + (c.uuid || c.id || "unknown");
       const n = (c.chat_messages || c.messages || []).length;
       if (String(known.get(id)) === String(n)) continue;
@@ -6230,22 +6332,20 @@ async function mem2MarkOfficialDirty(env, blob) {
 async function runOfficialImport(env) {
   const dirty = await env.DB.prepare(
     "SELECT key FROM sync_state WHERE key LIKE 'offdirty:%' ORDER BY updated_at LIMIT 5"
-  ).bind().all();
+  ).all();
   const rows = dirty.results || [];
   if (!rows.length) return { imported: 0, windows: 0 };
-  const blob = await kvGet(env, "archive:data");
-  const convs = blob?.data?.conversations || blob?.conversations || [];
-  const byId = new Map(convs.map(c => ["official:" + (c.uuid || c.id || "unknown"), c]));
   // 向量容量核算（best-effort：describe 拿不到就放行，FTS 反正全量）
   let vecCount = null;
   try { const d = await env.VEC.describe(); vecCount = d?.vectorCount ?? d?.vectorsCount ?? null; } catch (e) {}
   let imported = 0, windows = 0, skippedVec = 0;
   for (const row of rows) {
     if (windows >= MEM2_WINDOW_BUDGET) break;
-    const convId = row.key.slice(9);
-    const raw = byId.get(convId);
+    const convId = row.key.slice(9); // 'official:<uuid>'
+    const uuid = convId.startsWith("official:") ? convId.slice(9) : convId;
     const clearRow = env.DB.prepare("DELETE FROM sync_state WHERE key = ?").bind(row.key);
-    if (!raw) { await clearRow.run(); continue; } // blob 里已不存在：信号作废（档案是追加型，旧窗口保留）
+    const raw = await mem2LoadOfficialConv(env, uuid);
+    if (!raw) { await clearRow.run(); continue; } // 分片库里没有：信号作废（档案是追加型，旧窗口保留）
     const conv = mem2NormalizeOfficialConv(raw);
     const skipVectors = vecCount !== null && vecCount >= MEM2_VEC_BUDGET;
     const n = await mem2ImportConv(env, conv, "official", skipVectors);
@@ -6643,17 +6743,20 @@ async function handleMem2(request, env) {
   const path = url.pathname;
   const method = request.method;
   if (path === "/api/mem2/status" && method === "GET") {
-    const [wins, raws, l1, dirty, convs, lastrun] = await Promise.all([
+    const [wins, raws, l1, dirty, convs, lastrun, offConvs, offPending] = await Promise.all([
       env.DB.prepare("SELECT COUNT(*) AS c FROM archive_windows").first(),
       env.DB.prepare("SELECT COUNT(*) AS c FROM raw").first(),
       env.DB.prepare("SELECT COUNT(*) AS c FROM l1_memories WHERE superseded_by = ''").first(),
       env.DB.prepare("SELECT COUNT(*) AS c FROM sync_state WHERE key LIKE 'dirty:%'").first(),
       env.DB.prepare("SELECT COUNT(*) AS c FROM sync_state WHERE key LIKE 'archive:%'").first(),
       env.DB.prepare("SELECT value, updated_at FROM sync_state WHERE key = 'meta:l0-lastrun'").first(),
+      env.DB.prepare("SELECT COUNT(*) AS c FROM official_convs").first(),
+      env.DB.prepare("SELECT COUNT(*) AS c FROM sync_state WHERE key LIKE 'offdirty:%'").first(),
     ]);
     return jsonResponse({
       windows: wins?.c || 0, raw_rows: raws?.c || 0, l1_memories: l1?.c || 0,
       dirty_pending: dirty?.c || 0, archived_convs: convs?.c || 0,
+      official_convs: offConvs?.c || 0, official_pending: offPending?.c || 0,
       last_run: lastrun ? { at: lastrun.updated_at, ...JSON.parse(lastrun.value) } : null,
     });
   }
@@ -6700,7 +6803,38 @@ async function handleMem2(request, env) {
     return jsonResponse(await runExtraction(env, { bypassDisabled: force }));
   }
   if (path === "/api/mem2/official-run" && method === "POST") {
-    return jsonResponse(await runOfficialImport(env));
+    try {
+      return jsonResponse(await runOfficialImport(env));
+    } catch (e) {
+      const msg = String(e && (e.stack || e.message) || e).slice(0, 500);
+      try {
+        await env.DB.prepare(
+          "INSERT INTO sync_state (key, value, updated_at) VALUES ('meta:official-lasterr', ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')"
+        ).bind(msg).run();
+      } catch (e2) {}
+      return jsonResponse({ error: msg }, 500);
+    }
+  }
+  if (path === "/api/mem2/vec-run" && method === "POST") {
+    return jsonResponse({ embedded: await mem2ProcessVecQueue(env) });
+  }
+  // 官方档案分片上传：前端按批 POST {convs:[...]}（每批≤15场/约3MB），逐场比对水位线，没变的跳过
+  if (path === "/api/mem2/official-upload" && method === "POST") {
+    const body = await request.json();
+    const convs = Array.isArray(body.convs) ? body.convs : [];
+    let stored = 0, skipped = 0;
+    for (const c of convs) {
+      const r = await mem2StoreOfficialConv(env, c);
+      if (r === "stored") stored++; else skipped++;
+    }
+    return jsonResponse({ stored, skipped });
+  }
+  // 档案室按需取单场对话（懒加载阅读）
+  if (path === "/api/mem2/official-conv" && method === "GET") {
+    const uuid = url.searchParams.get("uuid") || "";
+    const conv = await mem2LoadOfficialConv(env, uuid);
+    if (!conv) return jsonResponse({ error: "not found" }, 404);
+    return jsonResponse({ conv });
   }
   if (path === "/api/mem2/extract-backfill" && method === "POST") {
     let cursor, marked = 0;
@@ -6757,6 +6891,7 @@ ctx.waitUntil(runHeartbeat(env));
 ctx.waitUntil(runKeepalive(env).catch(() => {})); // 缓存保活（与心跳互相独立，零副作用）
 ctx.waitUntil(runArchiveImport(env).catch(() => {})); // L0 装订工：只消化脏会话，无脏即空转
 ctx.waitUntil(runOfficialImport(env).catch(() => {})); // 官方档案装订工：消化 offdirty 信号，无脏即空转
+ctx.waitUntil(mem2ProcessVecQueue(env).catch(() => {})); // 大对话向量补录队列：每拍 200 窗，无队即空转
 ctx.waitUntil(runExtraction(env).catch(() => {})); // L1 摘录员：默认关（config:extraction），关着时只清信号队列
 // CN 22:30（UTC 14:30）那次顺便生成 daily 日记
 const cn = cnNow();
