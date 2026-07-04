@@ -815,6 +815,7 @@ function mergeSession(a, b) {
   };
   byRev("hidRev", "hiddenMids");
   byRev("favRev", "favs");
+  byRev("variantRev", "variantSel"); // 版本切换选择（哪条 slot 显示哪个变体）
   if ((older.summaryUpTo || 0) > (newer.summaryUpTo || 0)) {
     merged.summary = older.summary;
     merged.summaryUpTo = older.summaryUpTo;
