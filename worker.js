@@ -792,16 +792,35 @@ function mergeMessages(a = [], b = []) {
   return a.length >= b.length ? a : b;
 }
 
+// 与前端 src/utils/sessions.js mergeSession 同构，改一处必须同步改另一处。
+// 例外字段不走会话级 LWW（防陈旧设备一次写入整体清掉另一台的 hiddenMids/favs/摘要）：
+//   hiddenMids/favs 按各自版本号 hidRev/favRev 取高者；summary/summaryUpTo 成对取进度更远；distilled 取或。
 function mergeSession(a, b) {
   if (!a) return b;
   if (!b) return a;
   const newer = (a.updated_at || "") >= (b.updated_at || "") ? a : b;
   const older = newer === a ? b : a;
-  return {
+  const merged = {
     ...newer,                                          // 会话级字段（标题/删除标记）取较新
     created_at: older.created_at || newer.created_at,  // 创建时间取较早
     messages: mergeMessages(a.messages || [], b.messages || []),
   };
+  const byRev = (revKey, field) => {
+    const ra = a[revKey] || 0;
+    const rb = b[revKey] || 0;
+    const src = ra === rb ? newer : ra > rb ? a : b;
+    if (src[field] !== undefined) merged[field] = src[field];
+    else delete merged[field];
+    if (ra || rb) merged[revKey] = Math.max(ra, rb);
+  };
+  byRev("hidRev", "hiddenMids");
+  byRev("favRev", "favs");
+  if ((older.summaryUpTo || 0) > (newer.summaryUpTo || 0)) {
+    merged.summary = older.summary;
+    merged.summaryUpTo = older.summaryUpTo;
+  }
+  if (a.distilled || b.distilled) merged.distilled = true;
+  return merged;
 }
 
 // ─── 工具执行 ───
@@ -6064,10 +6083,13 @@ async function mem2Sha1(s) {
 
 async function mem2WindowsOf(conv) {
   const title = (conv.title || "").replace(/\s+/g, " ").trim().slice(0, 50);
+  const hidden = new Set(conv.hiddenMids || []); // 被重roll掉的旧回复，不入档
   const flat = [];
   for (const m of conv.messages || []) {
     if (m.role !== "user" && m.role !== "assistant") continue;
     if (m.distill) continue; // 沉淀汇报是派生文本，不是对话原文，不入档
+    if (m.error) continue; // 「（请求失败）」占位不是 Emet 的发言
+    if (m.mid && hidden.has(m.mid)) continue;
     const text = mem2TextOf(m.content).trim();
     if (!text) continue;
     const speaker = m.role === "user" ? MEM2_USER_NAME : MEM2_ASSISTANT_NAME;
@@ -6148,9 +6170,12 @@ async function mem2ImportConv(env, conv, sourceTag = "chat", skipVectors = false
     ).bind(w.id, w.metadata.conv_id, w.metadata.conv_title, w.metadata.date, w.metadata.date_int, w.metadata.seg_start, w.metadata.seg_end, w.text));
     sizes.push(w.text.length + 120);
   }
+  const rawHidden = new Set(conv.hiddenMids || []);
   (conv.messages || []).forEach((m, idx) => {
     if (m.role !== "user" && m.role !== "assistant") return;
     if (m.distill) return;
+    if (m.error) return; // 失败占位不进逐字索引
+    if (m.mid && rawHidden.has(m.mid)) return; // 重roll弃稿不进逐字索引
     const text = mem2TextOf(m.content).trim();
     if (text.length < 2) return;
     // 巨型消息（官方端贴长文档）按 8K 字切行：单条 15 万字的 trigram 索引会把 D1 一条 INSERT 打爆（实测 1101）
@@ -6727,8 +6752,12 @@ async function runExtraction(env, opts = {}) {
     const clearRow = env.DB.prepare("DELETE FROM sync_state WHERE key = ?").bind(row.key);
     const conv = await kvGet(env, "chat:" + convId);
     if (!conv || conv.deleted) { await clearRow.run(); continue; }
+    // 摘录也躲开失败占位与重roll弃稿（与 L0 装订工同口径）。
+    // 注意：加过滤会让 extractedUpTo 的下标基准前移、可能少量重摘，有 quote 机械校验兜底。
+    const extHidden = new Set(conv.hiddenMids || []);
     const msgs = (conv.messages || []).filter(m =>
-      (m.role === "user" || m.role === "assistant") && !m.distill && mem2TextOf(m.content).trim()
+      (m.role === "user" || m.role === "assistant") && !m.distill && !m.error &&
+      !(m.mid && extHidden.has(m.mid)) && mem2TextOf(m.content).trim()
     );
     const stRow = await env.DB.prepare("SELECT value FROM sync_state WHERE key = ?").bind("extract:" + convId).first();
     let state = { extractedUpTo: 0 };
