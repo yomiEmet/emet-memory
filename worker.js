@@ -5575,6 +5575,58 @@ document.getElementById('galaxyCloseBtn').addEventListener('click', gxClose);
 </html>
 `;
 
+// ════════════════════════════════════════════════════════════
+// 本机桥中转（relay）：让手机在线上前端聊"本机 Claude（订阅）"。
+// 流向：手机 ask（存 KV）→ 电脑桥轮询 take 认领 → 本机跑 claude -p →
+//       answer 写回 KV → 手机 poll 取结果。
+// 单用户单坑位：relay:ask 只有一个，后来的 ask 覆盖前面的（前端发送中会锁 UI，实际不并发）。
+// 鉴权：路径在 /api/* 统一闸门之后，X-Admin-Key 必须过，无新增暴露面。
+// KV 全带 TTL 自清理；刻意不用 list 操作（免撞免费档 list 配额）。
+// ════════════════════════════════════════════════════════════
+async function handleRelay(request, env) {
+const url = new URL(request.url);
+const path = url.pathname;
+const method = request.method;
+
+// 手机投递问题
+if (path === "/api/relay/ask" && method === "POST") {
+const body = await request.json();
+if (!Array.isArray(body.messages) || !body.messages.length) return jsonResponse({ error: "messages required" }, 400);
+const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const job = { id, system: body.system || "", messages: body.messages, model: body.model || "", ts: now() };
+await env.MEMORY.put("relay:ask", JSON.stringify(job), { expirationTtl: 120 });
+return jsonResponse({ id });
+}
+
+// 电脑桥取活（认领即删除，单用户无并发争抢）
+if (path === "/api/relay/take" && method === "GET") {
+const raw = await env.MEMORY.get("relay:ask");
+if (!raw) return jsonResponse({ none: true });
+await env.MEMORY.delete("relay:ask");
+return jsonResponse({ job: JSON.parse(raw) });
+}
+
+// 电脑桥交答案
+if (path === "/api/relay/answer" && method === "POST") {
+const body = await request.json();
+if (!body.id) return jsonResponse({ error: "id required" }, 400);
+const ans = { ok: !!body.ok, text: body.text || "", error: body.error || "", ts: now() };
+await env.MEMORY.put("relay:ans:" + body.id, JSON.stringify(ans), { expirationTtl: 300 });
+return jsonResponse({ saved: true });
+}
+
+// 手机取结果
+if (path === "/api/relay/poll" && method === "GET") {
+const id = url.searchParams.get("id");
+if (!id) return jsonResponse({ error: "id required" }, 400);
+const raw = await env.MEMORY.get("relay:ans:" + id);
+if (!raw) return jsonResponse({ pending: true });
+return jsonResponse({ done: true, ...JSON.parse(raw) });
+}
+
+return jsonResponse({ error: "Not found" }, 404);
+}
+
 // ─── 主入口 ───
 const ALLOWED_ORIGINS = [
 "https://emet-frontend.pages.dev",
@@ -8336,6 +8388,7 @@ return jsonResponse({ error: "Not found" }, 404);
 if (path.startsWith("/api/") && path !== "/api/auth" && !checkAuth(request, env)) {
 return jsonResponse({ error: "Unauthorized" }, 401);
 }
+if (path.startsWith("/api/relay/")) return handleRelay(request, env);
 if (path === "/api/migrate-vectors") return handleMigrateVectors(request, env);
 if (path === "/api/wake") return handleWake(request, env);
 if (path === "/api/archive-sweep") return handleArchiveSweep(request, env);
