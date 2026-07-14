@@ -5594,7 +5594,9 @@ const body = await request.json();
 if (!Array.isArray(body.messages) || !body.messages.length) return jsonResponse({ error: "messages required" }, 400);
 const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const job = { id, system: body.system || "", messages: body.messages, model: body.model || "", ts: now() };
-await env.MEMORY.put("relay:ask", JSON.stringify(job), { expirationTtl: 120 });
+// TTL 300s：与答案 TTL 一致，且给长回答（研究型问题/冷启动）留足时间，
+// 避免桥其实跑完了、手机侧却因坑位过期而误判"电脑没响应"。
+await env.MEMORY.put("relay:ask", JSON.stringify(job), { expirationTtl: 300 });
 return jsonResponse({ id });
 }
 
