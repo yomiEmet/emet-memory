@@ -5581,6 +5581,13 @@ const ALLOWED_ORIGINS = [
 "http://localhost:5173"
 ];
 
+// 手机同网直连本机桥（chat-server.cjs 静态托管前端）时，页面来源是
+// http://<电脑局域网IP>:8000，IP 随热点/路由器分配会变，没法写死进白名单。
+// 只放行 RFC1918 私有网段 + 8000 端口：公网域名/IP 不可能匹配上这个形状，
+// 且所有 /api/* 照旧要求 X-Admin-Key，放行 CORS 不放行数据，安全面不变。
+const LAN_BRIDGE_ORIGIN_RE = /^http:\/\/(?:192\.168\.\d{1,3}\.\d{1,3}|10\.(?:\d{1,3}\.){2}\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}):8000$/;
+const isAllowedOrigin = (origin) => ALLOWED_ORIGINS.includes(origin) || LAN_BRIDGE_ORIGIN_RE.test(origin);
+
 // ── /mcp、/sse 的 CORS ──
 // 对所有来源放行 *（浏览器非凭证请求 + claude.ai 连接器都需要）；
 // 关键：预检必须回显 Allow-Headers 含 X-Admin-Key，否则前端带头的
@@ -5614,7 +5621,7 @@ function withCors(response, request) {
 const origin = request.headers.get("Origin");
 const h = new Headers(response.headers);
 ["Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers", "Access-Control-Max-Age"].forEach(k => h.delete(k));
-if (origin && ALLOWED_ORIGINS.includes(origin)) {
+if (origin && isAllowedOrigin(origin)) {
 h.set("Access-Control-Allow-Origin", origin);
 h.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
 h.set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key");
