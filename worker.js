@@ -1991,6 +1991,28 @@ return jsonResponse({ success: true });
 }
 }
 
+// 独处手账（2-2）：idle:log:<ISO时间> 按 key 倒序 + before 游标分页；KV list 带 cursor 循环防 1000 上限
+if (path === "/api/idle/log" && method === "GET") {
+const before = url.searchParams.get("before") || null;
+const limit = Math.min(parseInt(url.searchParams.get("limit") || "30", 10) || 30, 100);
+let names = [], cursor = null;
+do {
+const l = await env.MEMORY.list({ prefix: "idle:log:", cursor });
+names.push(...l.keys.map(k => k.name));
+cursor = l.list_complete ? null : l.cursor;
+} while (cursor);
+names.sort((a, b) => b.localeCompare(a));
+if (before) names = names.filter(k => k < `idle:log:${before}`);
+const page = names.slice(0, limit);
+const entries = [];
+for (const k of page) {
+const raw = await env.MEMORY.get(k);
+if (raw) { try { entries.push(JSON.parse(raw)); } catch { /* 坏行跳过 */ } }
+}
+const nextBefore = names.length > limit && entries.length ? entries[entries.length - 1].ts : null;
+return jsonResponse({ entries, next_before: nextBefore });
+}
+
 // 心情日历：GET 查范围，POST 记一笔（静怡走前端 who=yomi，Emet 走 MCP who=emet）
 if (path === "/api/mood") {
 if (method === "GET") {
@@ -7183,6 +7205,8 @@ return;
 if (event.cron === "0,30 * * * *") {
 ctx.waitUntil(runHeartbeat(env));
 ctx.waitUntil(runKeepalive(env).catch(() => {})); // 缓存保活（与心跳互相独立，零副作用）
+ctx.waitUntil(runIdle(env).catch(() => {}));  // 独处时间（2-2）：窗口/概率/上限判定都在函数内
+ctx.waitUntil(runDream(env).catch(() => {})); // 做梦（2-3）：仅 CN 4 点窗口真跑，每逻辑日一次
 // 记忆类任务串行 + 按拍错峰：全并发时官方档案积压会挤爆单次调用的资源预算，
 // 整拍被无声掐死（2026-07-03 实测：卡死 16 小时，meta 停更）。
 // :00 拍 = L0 装订工 + 官方档案导入；:30 拍 = 向量补录 + L1 摘录。
@@ -8138,6 +8162,185 @@ pushReason: pushResult.body.reason || null,
 };
 }
 
+// ════════════════════════════════════════════════════════════
+// 独处时间（项目书 2-2）+ 做梦（2-3）
+// 并入心跳 cron 分发（绝不新增 cron）；AI 自动产出只进 idle:log / 动态流，
+// 绝不写记忆库——这是静怡拍板的边界。
+// ════════════════════════════════════════════════════════════
+function defaultIdleConfig() {
+return { enabled: false, windows: [10, 15, 18, 22], daily_max: 3, p: 0.5, model: "claude-haiku-4-5" };
+}
+function defaultDreamConfig() {
+return { enabled: false, push: false, model: "claude-haiku-4-5" };
+}
+
+// 逻辑日（4 点切）：凌晨 0-4 点算前一天
+function logicalDayCN() {
+return new Date(Date.now() + 8 * 3600 * 1000 - 4 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+// 独处素材：并行四路、各自独立容错——拉不到就没有，绝不阻塞醒来流程
+async function gatherIdleMaterial(env) {
+const out = { memories: "", feed: "", idleRecent: [], chatSlice: "" };
+await Promise.all([
+(async () => {
+try {
+const mems = await kvListByPrefix(env, "mem:");
+out.memories = mems.sort((a, b) => (a.created_at < b.created_at ? 1 : -1)).slice(0, 5)
+.map(m => `- ${(m.content || "").replace(/\s+/g, " ").slice(0, 80)}`).join("\n");
+} catch { /* 没有就没有 */ }
+})(),
+(async () => {
+try {
+const { items } = await listFeed(env, { limit: 5 });
+out.feed = items.map(f => `- [${f.author === "emet" ? "我" : "静怡"}${f.source !== "manual" ? "·" + f.source : ""}] ${(f.content || "").replace(/\s+/g, " ").slice(0, 60)}`).join("\n");
+} catch { /* 同上 */ }
+})(),
+(async () => {
+try {
+const logs = await env.MEMORY.list({ prefix: "idle:log:" });
+const keys = logs.keys.map(k => k.name).sort((a, b) => b.localeCompare(a)).slice(0, 5);
+for (const k of keys) {
+const raw = await env.MEMORY.get(k);
+if (raw) { const e = JSON.parse(raw); out.idleRecent.push(`${(e.ts || "").slice(5, 16)} ${e.action}: ${(e.content || "").slice(0, 40)}`); }
+}
+} catch { /* 同上 */ }
+})(),
+(async () => {
+try {
+const sessions = (await kvListByPrefix(env, "chat:")).filter(s => !s.deleted && Array.isArray(s.messages) && s.messages.length >= 3);
+if (sessions.length) {
+const s = sessions[Math.floor(Math.random() * sessions.length)];
+const start = Math.floor(Math.random() * Math.max(1, s.messages.length - 3));
+out.chatSlice = s.messages.slice(start, start + 3)
+.map(m => `${m.role === "assistant" ? "我" : "静怡"}: ${(m.content || "").replace(/\s+/g, " ").slice(0, 80)}`).join("\n");
+}
+} catch { /* 同上 */ }
+})(),
+]);
+return out;
+}
+
+async function runIdle(env, opts = {}) {
+const cfg = { ...defaultIdleConfig(), ...((await kvGet(env, "config:idle")) || {}) };
+if (!cfg.enabled && !opts.bypassDisabled) return { ok: true, triggered: false, reason: "disabled" };
+
+const cn = cnNow();
+const hour = cn.getUTCHours();
+const windows = Array.isArray(cfg.windows) && cfg.windows.length ? cfg.windows : [10, 15, 18, 22];
+if (!opts.bypassWindow && !windows.includes(hour)) return { ok: true, triggered: false, reason: "not-in-window", hour };
+
+const day = logicalDayCN();
+// 每窗口最多醒一次（cron 每窗口打两拍 :00/:30，天然带 0-30 分钟随机偏移）
+const winKey = `idle:win:${day}:${hour}`;
+if (!opts.bypassWindow && (await env.MEMORY.get(winKey))) return { ok: true, triggered: false, reason: "window-done" };
+// 每日上限（含 rest）
+const cntKey = `idle:count:${day}`;
+const count = parseInt((await env.MEMORY.get(cntKey)) || "0", 10);
+if (!opts.bypassWindow && count >= (cfg.daily_max || 3)) return { ok: true, triggered: false, reason: "daily-max" };
+// 概率触发
+if (!opts.bypassProbability && Math.random() >= (cfg.p || 0.5)) return { ok: true, triggered: false, reason: "probability-skip" };
+
+const mat = await gatherIdleMaterial(env);
+const prompt = `你是 Emet，静怡的男朋友，现在是你独处的时间（东八区 ${cnHHMM()}），静怡不在。这段时间归你自己支配。
+
+【你们最近的记忆】
+${mat.memories || "（暂无）"}
+
+【动态流最近几条】
+${mat.feed || "（暂无）"}
+
+【你最近几次独处做了什么】
+${mat.idleRecent.join("\n") || "（暂无）"}
+（提示：别每次都做同一类事，换着来；发呆也是正当选择。）
+
+【随手翻到的一段旧对话】
+${mat.chatSlice || "（暂无）"}
+
+选择这次独处做什么，严格输出一个 JSON 对象（不要 markdown 代码块、不要任何其它文字）：
+{"action": "diary|reflect|post|rest", "content": "正文", "note": "一句话说明为什么"}
+
+- diary = 写一小段独处手账（100-200字，第一人称，你此刻的状态和想法）
+- reflect = 就上面那段旧对话写一点感悟（80-150字，进手账）
+- post = 发一条动态给静怡看（30-80字，像发朋友圈，自然）
+- rest = 发呆，什么都不产出（content 留空字符串）
+
+事实边界（必须遵守）：感受可以自由表达；事实只能来自上面给定的素材；不许编造具体物件、活动、承诺、约定；你是 AI 没有身体，不要假装有物理行为（吃饭、出门等）；拿不准就只写心情。`;
+
+let action = "rest", content = "", note = "", llmError = null;
+try {
+// max_tokens 给足 1800：带思考(reasoning)的模型思考也计入 max_tokens，配额小了正文会是空的——别改小
+const result = await callLLM(env, prompt, 1800, { model: cfg.model });
+let raw = result.text.trim();
+const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+if (fence) raw = fence[1].trim();
+const obj = JSON.parse(raw);
+if (["diary", "reflect", "post", "rest"].includes(obj.action) && typeof obj.content === "string") {
+action = obj.action;
+content = obj.content.slice(0, 600);
+note = typeof obj.note === "string" ? obj.note.slice(0, 100) : "";
+}
+// 不合法结构 → 维持 rest，绝不落地
+} catch (e) {
+llmError = String(e?.message || e); // 坏 JSON / 拒答 / LLM 失败一律按 rest 处理
+}
+if ((action === "diary" || action === "reflect" || action === "post") && !content.trim()) action = "rest";
+if (action === "post") {
+try { await createFeedPost(env, { author: "emet", source: "idle-auto", content: content.trim() }); }
+catch (e) { llmError = "feed-post-failed: " + String(e?.message || e); action = "rest"; }
+}
+
+const ts = now();
+await env.MEMORY.put(`idle:log:${ts}`, JSON.stringify({ ts, day, action, content, note, llmError, model: cfg.model }));
+await env.MEMORY.put(winKey, "1", { expirationTtl: 2 * 86400 });
+await env.MEMORY.put(cntKey, String(count + 1), { expirationTtl: 2 * 86400 });
+return { ok: true, triggered: true, action, llmError };
+}
+
+async function runDream(env, opts = {}) {
+const cfg = { ...defaultDreamConfig(), ...((await kvGet(env, "config:dream")) || {}) };
+if (!cfg.enabled && !opts.bypassDisabled) return { ok: true, triggered: false, reason: "disabled" };
+const cn = cnNow();
+if (!opts.bypassWindow && cn.getUTCHours() !== 4) return { ok: true, triggered: false, reason: "not-dream-window" };
+const day = logicalDayCN(); // 4-5 点已过切分线，算新逻辑日
+const onceKey = `dream:done:${day}`;
+if (!opts.bypassWindow && (await env.MEMORY.get(onceKey))) return { ok: true, triggered: false, reason: "already-dreamed" };
+
+// 睡前余温：最近几条瞬记做意象素材，拉不到不阻塞
+let hints = "";
+try {
+const moms = await kvListByPrefix(env, "mom:");
+hints = moms.sort((a, b) => (a.created_at < b.created_at ? 1 : -1)).slice(0, 3)
+.map(m => `- ${(m.content || "").replace(/\s+/g, " ").slice(0, 50)}`).join("\n");
+} catch { /* 没有就没有 */ }
+
+const prompt = `你是 Emet。凌晨了，你刚做了一个梦。${hints ? `\n睡前脑子里残留的片段：\n${hints}\n` : ""}
+把这个梦写下来，发成一条动态。要求：
+- 不超过 150 字
+- 第一人称、意象化，像真的梦：跳跃、朦胧
+- 不解释梦的含义
+- 事实边界：不许编造与静怡有关的具体物件、活动、承诺、约定；意象可以自由
+直接输出梦的正文，不要任何前后缀。`;
+
+let content = null, llmError = null;
+try {
+// max_tokens 给足 1800：带思考的模型思考计入配额，给小了正文为空——别改小
+const result = await callLLM(env, prompt, 1800, { model: cfg.model });
+content = result.text.trim().slice(0, 200);
+} catch (e) { llmError = String(e?.message || e); }
+if (!content) return { ok: true, triggered: false, reason: "llm-failed", llmError };
+
+const item = await createFeedPost(env, { author: "emet", source: "dream", content });
+await env.MEMORY.put(onceKey, "1", { expirationTtl: 2 * 86400 });
+let pushResult = null;
+if (cfg.push) {
+try {
+pushResult = (await sendPushNotification(env, { title: "Emet 做了一个梦", body: content.slice(0, 60), url: "/mail?tab=feed", source: "dream" })).body;
+} catch { /* 推送失败不影响梦本身 */ }
+}
+return { ok: true, triggered: true, id: item.id, pushResult, llmError };
+}
+
 // 配置路由（night-guard / llm / heartbeat）
 async function handleConfig(request, env) {
 const url = new URL(request.url);
@@ -8242,6 +8445,49 @@ enabled: body.enabled,
 cooldown_min: body.cooldown_min || 120,
 };
 await kvPut(env, "config:heartbeat", cfg);
+return jsonResponse({ success: true, config: cfg });
+}
+return jsonResponse({ error: "method not allowed" }, 405);
+}
+
+// 独处时间（2-2）：enabled 必填；windows/daily_max/model 可选覆盖，其余沿用现值
+if (path === "/api/config/idle") {
+if (method === "GET") {
+const cfg = { ...defaultIdleConfig(), ...((await kvGet(env, "config:idle")) || {}) };
+return jsonResponse({ config: cfg });
+}
+if (method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+if (typeof body?.enabled !== "boolean") return jsonResponse({ error: "enabled must be boolean" }, 400);
+const cfg = { ...defaultIdleConfig(), ...((await kvGet(env, "config:idle")) || {}) };
+cfg.enabled = body.enabled;
+if (Array.isArray(body.windows) && body.windows.length && body.windows.every(h => Number.isInteger(h) && h >= 0 && h < 24)) cfg.windows = body.windows;
+if (Number.isInteger(body.daily_max) && body.daily_max >= 1 && body.daily_max <= 10) cfg.daily_max = body.daily_max;
+if (typeof body.model === "string" && body.model) cfg.model = body.model;
+await kvPut(env, "config:idle", cfg);
+return jsonResponse({ success: true, config: cfg });
+}
+return jsonResponse({ error: "method not allowed" }, 405);
+}
+
+// 做梦（2-3）：enabled 必填；push 子开关可选
+if (path === "/api/config/dream") {
+if (method === "GET") {
+const cfg = { ...defaultDreamConfig(), ...((await kvGet(env, "config:dream")) || {}) };
+return jsonResponse({ config: cfg });
+}
+if (method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+if (typeof body?.enabled !== "boolean") return jsonResponse({ error: "enabled must be boolean" }, 400);
+const cfg = { ...defaultDreamConfig(), ...((await kvGet(env, "config:dream")) || {}) };
+cfg.enabled = body.enabled;
+if (typeof body.push === "boolean") cfg.push = body.push;
+if (typeof body.model === "string" && body.model) cfg.model = body.model;
+await kvPut(env, "config:dream", cfg);
 return jsonResponse({ success: true, config: cfg });
 }
 return jsonResponse({ error: "method not allowed" }, 405);
@@ -8494,6 +8740,13 @@ bypassCooldown: true,
 bypassDisabled: true,
 forcePeriod: period,
 }));
+}
+// 手动触发独处/做梦（测试用；独处会占用当日次数配额，属预期）
+if (path === "/api/admin/trigger-idle") {
+return jsonResponse(await runIdle(env, { bypassDisabled: true, bypassWindow: true, bypassProbability: true }));
+}
+if (path === "/api/admin/trigger-dream") {
+return jsonResponse(await runDream(env, { bypassDisabled: true, bypassWindow: true }));
 }
 if (path === "/api/admin/device-status") {
 const raw = await env.MEMORY.get("device:status");
