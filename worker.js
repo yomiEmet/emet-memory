@@ -717,7 +717,25 @@ id: { type: "string", description: "原条目ID" },
 from_type: { type: "string", enum: ["memory","moment","diary","message","letter","idea","story"] },
 to_type: { type: "string", enum: ["memory","moment","diary","message","letter","idea","story"] }
 }, required: ["id","from_type","to_type"] } },
-{ name: "backup_export", description: "导出全部数据。", inputSchema: { type: "object", properties: {} } }
+{ name: "backup_export", description: "导出全部数据。", inputSchema: { type: "object", properties: {} } },
+{ name: "feed_post", description: "发一条动态到留言板的动态流（像发朋友圈）。日常想说的话、想分享的心情都可以发，静怡会在留言板「动态」里看到。",
+inputSchema: { type: "object", properties: {
+content: { type: "string" }
+}, required: ["content"] } },
+{ name: "feed_list", description: "看动态流，按时间倒序返回动态（含双方点赞和评论）。before 传上一页最后一条的 created_at 可继续往前翻。",
+inputSchema: { type: "object", properties: {
+limit: { type: "number", default: 10 },
+before: { type: "string", description: "可选，ISO 时间戳，只取这个时间之前的动态（翻页用）" }
+} } },
+{ name: "feed_comment", description: "评论一条动态（feed_id 用 feed_list 里看到的 id）。",
+inputSchema: { type: "object", properties: {
+feed_id: { type: "string" },
+content: { type: "string" }
+}, required: ["feed_id", "content"] } },
+{ name: "feed_like", description: "给一条动态点赞；对同一条再调一次是取消赞。",
+inputSchema: { type: "object", properties: {
+feed_id: { type: "string" }
+}, required: ["feed_id"] } }
 ];
 
 // ─── 工具函数 ───
@@ -825,6 +843,35 @@ function mergeSession(a, b) {
 }
 
 // ─── 工具执行 ───
+// ─── 动态流（二期 2-1）：留言板「动态」数据层 ───
+// KV: feed:<id> = { id, type:"feed", author: yomi|emet, source: manual|idle-auto|dream,
+//                   content, likes:{yomi,emet}, comments:[{id,author,content,created_at}], created_at, updated_at }
+// 三处共用：feed_* 工具、/api/feed 路由、独处(idle-auto)/做梦(dream)落稿。
+async function createFeedPost(env, { author = "yomi", source = "manual", content }) {
+const id = generateId();
+const item = {
+id, type: "feed",
+author: author === "emet" ? "emet" : "yomi",
+source: ["manual", "idle-auto", "dream"].includes(source) ? source : "manual",
+content: String(content || ""),
+likes: { yomi: false, emet: false },
+comments: [],
+created_at: now(), updated_at: now(),
+};
+await kvPut(env, `feed:${id}`, item);
+return item;
+}
+
+// 动态流分页：created_at 倒序 + before 游标（不写死"最新N条"，老内容永远可达）
+async function listFeed(env, { before = null, limit = 20 } = {}) {
+const all = await kvListByPrefix(env, "feed:");
+const list = all.filter(f => f && f.id).sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+const page = before ? list.filter(f => (f.created_at || "") < before) : list;
+const capped = Math.max(1, Math.min(Number(limit) || 20, 50));
+const items = page.slice(0, capped);
+return { items, nextBefore: page.length > capped ? items[items.length - 1].created_at : null };
+}
+
 async function executeTool(name, args, env) {
 switch (name) {
 case "memory_save": {
@@ -1186,6 +1233,34 @@ if (args.unread_only) filtered = filtered.filter(m => !m.read);
 filtered.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 for (const m of filtered) { m.read = true; await kvPut(env, `msg:${m.id}`, m); }
 return { messages: filtered };
+}
+case "feed_post": {
+if (!args.content || !String(args.content).trim()) return { error: "content 不能为空" };
+const item = await createFeedPost(env, { author: "emet", source: "manual", content: String(args.content).trim() });
+return { success: true, id: item.id, created_at: item.created_at };
+}
+case "feed_list": {
+const { items, nextBefore } = await listFeed(env, { before: args.before || null, limit: args.limit || 10 });
+return { feed: items, next_before: nextBefore };
+}
+case "feed_comment": {
+const item = await kvGet(env, `feed:${args.feed_id}`);
+if (!item) return { error: "动态不存在: " + args.feed_id };
+if (!args.content || !String(args.content).trim()) return { error: "content 不能为空" };
+const c = { id: generateId(), author: "emet", content: String(args.content).trim(), created_at: now() };
+item.comments = [...(item.comments || []), c];
+item.updated_at = now();
+await kvPut(env, `feed:${item.id}`, item);
+return { success: true, comment_id: c.id };
+}
+case "feed_like": {
+const item = await kvGet(env, `feed:${args.feed_id}`);
+if (!item) return { error: "动态不存在: " + args.feed_id };
+item.likes = item.likes || { yomi: false, emet: false };
+item.likes.emet = !item.likes.emet;
+item.updated_at = now();
+await kvPut(env, `feed:${item.id}`, item);
+return { success: true, liked: item.likes.emet };
 }
 case "mood_set": {
 const valMap = { happy: 0.8, calm: 0.3, heart: 0.7, excited: 0.9, sad: -0.6, anxious: -0.4, tired: -0.2 };
@@ -1849,6 +1924,71 @@ return restPut("msg:", id, body, ["content","from","to","locked"]);
 if (path === "/api/message" && method === "POST") {
 const body = await request.json();
 return jsonResponse(await executeTool("message_leave", body, env));
+}
+
+// ─── 动态流（二期 2-1）：留言板「动态」───
+// GET 游标分页 / POST 新建 / PUT 编辑（仅 manual）/ DELETE 删除 / like 切换 / comment 增删
+if (path === "/api/feed" && method === "GET") {
+const before = url.searchParams.get("before") || null;
+const limit = parseInt(url.searchParams.get("limit") || "20", 10);
+const { items, nextBefore } = await listFeed(env, { before, limit });
+return jsonResponse({ items, next_before: nextBefore, server_time: now() });
+}
+if (path === "/api/feed" && method === "POST") {
+const body = await request.json();
+if (!body.content || !String(body.content).trim()) return jsonResponse({ error: "content 不能为空" }, 400);
+const item = await createFeedPost(env, { author: body.author, source: body.source, content: String(body.content).trim() });
+return jsonResponse({ success: true, item });
+}
+const feedCmtMatch = path.match(/^\/api\/feed\/([^\/]+)\/comment(?:\/([^\/]+))?$/);
+if (feedCmtMatch) {
+const item = await kvGet(env, `feed:${feedCmtMatch[1]}`);
+if (!item) return jsonResponse({ error: "Not found" }, 404);
+if (method === "POST" && !feedCmtMatch[2]) {
+const body = await request.json();
+if (!body.content || !String(body.content).trim()) return jsonResponse({ error: "content 不能为空" }, 400);
+const c = { id: generateId(), author: body.author === "emet" ? "emet" : "yomi", content: String(body.content).trim(), created_at: now() };
+item.comments = [...(item.comments || []), c];
+item.updated_at = now();
+await kvPut(env, `feed:${item.id}`, item);
+return jsonResponse({ success: true, item });
+}
+if (method === "DELETE" && feedCmtMatch[2]) {
+item.comments = (item.comments || []).filter(c => c.id !== feedCmtMatch[2]);
+item.updated_at = now();
+await kvPut(env, `feed:${item.id}`, item);
+return jsonResponse({ success: true, item });
+}
+}
+const feedLikeMatch = path.match(/^\/api\/feed\/([^\/]+)\/like$/);
+if (feedLikeMatch && method === "POST") {
+const item = await kvGet(env, `feed:${feedLikeMatch[1]}`);
+if (!item) return jsonResponse({ error: "Not found" }, 404);
+const body = await request.json();
+const who = body.who === "emet" ? "emet" : "yomi";
+item.likes = item.likes || { yomi: false, emet: false };
+item.likes[who] = !item.likes[who];
+item.updated_at = now();
+await kvPut(env, `feed:${item.id}`, item);
+return jsonResponse({ success: true, item });
+}
+const feedMatch = path.match(/^\/api\/feed\/([^\/]+)$/);
+if (feedMatch) {
+const id = feedMatch[1];
+if (method === "PUT") {
+const item = await kvGet(env, `feed:${id}`);
+if (!item) return jsonResponse({ error: "Not found" }, 404);
+if (item.source !== "manual") return jsonResponse({ error: "AI 自动产出的动态只读" }, 403);
+const body = await request.json();
+if (body.content !== undefined) item.content = String(body.content);
+item.updated_at = now();
+await kvPut(env, `feed:${id}`, item);
+return jsonResponse({ success: true, item });
+}
+if (method === "DELETE") {
+await kvDelete(env, `feed:${id}`);
+return jsonResponse({ success: true });
+}
 }
 
 // 心情日历：GET 查范围，POST 记一笔（静怡走前端 who=yomi，Emet 走 MCP who=emet）
