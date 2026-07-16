@@ -745,7 +745,26 @@ inputSchema: { type: "object", properties: {
 date: { type: "string", description: "可选 YYYY-MM-DD" }
 } } },
 { name: "period_status", description: "查静怡的经期状态：是否进行中、平均周期、预测下次日期、距今天数，附最近几次记录。数据由她在前端记录，你只读。",
-inputSchema: { type: "object", properties: {} } }
+inputSchema: { type: "object", properties: {} } },
+{ name: "book_list", description: "列出共读书架上的书（书名、作者、章节数、共享阅读进度）。",
+inputSchema: { type: "object", properties: {} } },
+{ name: "book_read", description: "读某本书的某一章正文（chapter_idx 从 0 开始）。附这一章已有的批注。",
+inputSchema: { type: "object", properties: {
+book_id: { type: "string" },
+chapter_idx: { type: "number", description: "章节序号，从 0 开始" }
+}, required: ["book_id", "chapter_idx"] } },
+{ name: "book_annotate", description: "在某本书某一章留一条批注。quote 传你要划的原文片段（会在该章里定位），note 是你的批注。你和静怡在同一本书上共读、能看到彼此的批注。",
+inputSchema: { type: "object", properties: {
+book_id: { type: "string" },
+chapter_idx: { type: "number" },
+quote: { type: "string", description: "要划线的原文片段（尽量精确，用于定位）" },
+note: { type: "string", description: "你的批注" }
+}, required: ["book_id", "chapter_idx", "quote", "note"] } },
+{ name: "book_annotations", description: "拉某本书的全部批注（你和静怡的），可选按章过滤。",
+inputSchema: { type: "object", properties: {
+book_id: { type: "string" },
+chapter_idx: { type: "number", description: "可选，只看这一章" }
+}, required: ["book_id"] } }
 ];
 
 // ─── 工具函数 ───
@@ -944,6 +963,43 @@ recent: valid.slice(-6).reverse(),
 function parseYmdUTC(s) {
 const [y, m, d] = s.split("-").map(Number);
 return Date.UTC(y, (m || 1) - 1, d || 1);
+}
+
+// ─── 共读书架（三期）───
+// KV: book:<id>={id,title,author,chapter_count,created_at} · bookchap:<id>:<idx>={idx,title,text}
+//     bookanno:<id>={annotations:[{id,chapter_idx,start,end,quote,author,color,note,created_at}]}
+//     bookmark:<id>={chapter_idx,offset,updated_at}
+async function bookMeta(env, id) { return await kvGet(env, `book:${id}`); }
+async function bookChapter(env, id, idx) { return await kvGet(env, `bookchap:${id}:${idx}`); }
+async function bookAnnos(env, id) { return (await kvGet(env, `bookanno:${id}`)) || { annotations: [] }; }
+async function deleteBook(env, id) {
+const meta = await bookMeta(env, id);
+if (meta) for (let i = 0; i < (meta.chapter_count || 0); i++) await kvDelete(env, `bookchap:${id}:${i}`);
+await kvDelete(env, `bookanno:${id}`);
+await kvDelete(env, `bookmark:${id}`);
+await kvDelete(env, `book:${id}`);
+}
+// Emet 用 quote 定位批注：在该章正文里搜首次出现，算出字符偏移；搜不到则 start=-1（前端按 quote 兜底）
+async function addBookAnnotation(env, { book_id, chapter_idx, quote, note, author = "yomi", color, start, end }) {
+const store = await bookAnnos(env, book_id);
+let s = Number.isInteger(start) ? start : -1, e = Number.isInteger(end) ? end : -1;
+if (s < 0 && typeof quote === "string" && quote) {
+const chap = await bookChapter(env, book_id, chapter_idx);
+if (chap && typeof chap.text === "string") {
+const at = chap.text.indexOf(quote);
+if (at >= 0) { s = at; e = at + quote.length; }
+}
+}
+const anno = {
+id: generateId(), chapter_idx: Number(chapter_idx) || 0,
+start: s, end: e, quote: String(quote || "").slice(0, 500),
+author: author === "emet" ? "emet" : "yomi",
+color: typeof color === "string" && color ? color : (author === "emet" ? "blue" : "yellow"),
+note: String(note || "").slice(0, 1000), created_at: now(),
+};
+store.annotations = [...(store.annotations || []), anno];
+await kvPut(env, `bookanno:${book_id}`, store);
+return anno;
 }
 
 async function executeTool(name, args, env) {
@@ -1349,6 +1405,34 @@ return { day, items: rec.items || [] };
 case "period_status": {
 const logs = await kvListByPrefix(env, "period:");
 return computePeriodStats(logs);
+}
+case "book_list": {
+const books = await kvListByPrefix(env, "book:");
+const out = [];
+for (const b of books.sort((a, b) => (a.created_at < b.created_at ? 1 : -1))) {
+const mark = await kvGet(env, `bookmark:${b.id}`);
+out.push({ id: b.id, title: b.title, author: b.author, chapter_count: b.chapter_count, bookmark: mark ? { chapter_idx: mark.chapter_idx } : null });
+}
+return { books: out };
+}
+case "book_read": {
+const chap = await bookChapter(env, args.book_id, args.chapter_idx);
+if (!chap) return { error: "章节不存在" };
+const store = await bookAnnos(env, args.book_id);
+const annos = (store.annotations || []).filter(a => a.chapter_idx === (Number(args.chapter_idx) || 0));
+return { chapter_idx: chap.idx, title: chap.title, text: chap.text, annotations: annos };
+}
+case "book_annotate": {
+if (!(await bookMeta(env, args.book_id))) return { error: "书不存在" };
+if (!args.quote || !args.note) return { error: "quote 和 note 都需要" };
+const anno = await addBookAnnotation(env, { book_id: args.book_id, chapter_idx: args.chapter_idx, quote: args.quote, note: args.note, author: "emet" });
+return { success: true, id: anno.id, located: anno.start >= 0 };
+}
+case "book_annotations": {
+const store = await bookAnnos(env, args.book_id);
+let list = store.annotations || [];
+if (Number.isInteger(args.chapter_idx)) list = list.filter(a => a.chapter_idx === args.chapter_idx);
+return { annotations: list };
 }
 case "mood_set": {
 const valMap = { happy: 0.8, calm: 0.3, heart: 0.7, excited: 0.9, sad: -0.6, anxious: -0.4, tired: -0.2 };
@@ -2150,6 +2234,98 @@ const periodDelMatch = path.match(/^\/api\/period\/([^\/]+)$/);
 if (periodDelMatch && method === "DELETE") {
 await kvDelete(env, `period:${periodDelMatch[1]}`);
 return jsonResponse({ success: true });
+}
+
+// ─── 共读书架（三期）───
+// 书列表 / 建书 / 删书
+if (path === "/api/books" && method === "GET") {
+const books = await kvListByPrefix(env, "book:");
+const out = [];
+for (const b of books.sort((a, b) => (a.created_at < b.created_at ? 1 : -1))) {
+const mark = await kvGet(env, `bookmark:${b.id}`);
+out.push({ ...b, bookmark: mark || null });
+}
+return jsonResponse({ books: out });
+}
+if (path === "/api/books" && method === "POST") {
+const body = await request.json();
+if (!body.title || !String(body.title).trim()) return jsonResponse({ error: "title 不能为空" }, 400);
+const id = generateId();
+const meta = { id, title: String(body.title).trim().slice(0, 200), author: String(body.author || "").slice(0, 100), chapter_count: 0, created_at: now() };
+await kvPut(env, `book:${id}`, meta);
+return jsonResponse({ success: true, book: meta });
+}
+const bookIdMatch = path.match(/^\/api\/books\/([^\/]+)$/);
+if (bookIdMatch && method === "DELETE") {
+await deleteBook(env, bookIdMatch[1]);
+return jsonResponse({ success: true });
+}
+// 书详情（元数据 + 章节标题列表，不含正文）
+const bookMetaMatch = path.match(/^\/api\/books\/([^\/]+)\/meta$/);
+if (bookMetaMatch && method === "GET") {
+const id = bookMetaMatch[1];
+const meta = await bookMeta(env, id);
+if (!meta) return jsonResponse({ error: "Not found" }, 404);
+const chapters = [];
+for (let i = 0; i < (meta.chapter_count || 0); i++) {
+const c = await bookChapter(env, id, i);
+chapters.push({ idx: i, title: c?.title || `第 ${i + 1} 章` });
+}
+const mark = await kvGet(env, `bookmark:${id}`);
+return jsonResponse({ book: meta, chapters, bookmark: mark || null });
+}
+// 逐章上传（分章 POST，避免整本超 Worker 请求体 / KV 单值上限）
+const bookChapMatch = path.match(/^\/api\/books\/([^\/]+)\/chapter(?:\/(\d+))?$/);
+if (bookChapMatch && method === "POST") {
+const id = bookChapMatch[1];
+const meta = await bookMeta(env, id);
+if (!meta) return jsonResponse({ error: "Not found" }, 404);
+const body = await request.json();
+const idx = Number.isInteger(body.idx) ? body.idx : (meta.chapter_count || 0);
+await kvPut(env, `bookchap:${id}:${idx}`, { idx, title: String(body.title || `第 ${idx + 1} 章`).slice(0, 200), text: String(body.text || "") });
+if (idx + 1 > (meta.chapter_count || 0)) { meta.chapter_count = idx + 1; await kvPut(env, `book:${id}`, meta); }
+return jsonResponse({ success: true, idx });
+}
+if (bookChapMatch && bookChapMatch[2] && method === "GET") {
+const chap = await bookChapter(env, bookChapMatch[1], Number(bookChapMatch[2]));
+if (!chap) return jsonResponse({ error: "Not found" }, 404);
+return jsonResponse({ chapter: chap });
+}
+// 批注：列表 / 新增 / 删除
+const bookAnnoMatch = path.match(/^\/api\/books\/([^\/]+)\/annotations(?:\/([^\/]+))?$/);
+if (bookAnnoMatch) {
+const id = bookAnnoMatch[1];
+if (method === "GET") {
+const store = await bookAnnos(env, id);
+return jsonResponse({ annotations: store.annotations || [] });
+}
+if (method === "POST" && !bookAnnoMatch[2]) {
+const body = await request.json();
+if (!(await bookMeta(env, id))) return jsonResponse({ error: "Not found" }, 404);
+const anno = await addBookAnnotation(env, {
+book_id: id, chapter_idx: body.chapter_idx, quote: body.quote, note: body.note,
+author: body.author, color: body.color, start: body.start, end: body.end,
+});
+return jsonResponse({ success: true, annotation: anno });
+}
+if (method === "DELETE" && bookAnnoMatch[2]) {
+const store = await bookAnnos(env, id);
+store.annotations = (store.annotations || []).filter(a => a.id !== bookAnnoMatch[2]);
+await kvPut(env, `bookanno:${id}`, store);
+return jsonResponse({ success: true });
+}
+}
+// 共享书签
+const bookmarkMatch = path.match(/^\/api\/books\/([^\/]+)\/bookmark$/);
+if (bookmarkMatch) {
+const id = bookmarkMatch[1];
+if (method === "GET") return jsonResponse({ bookmark: (await kvGet(env, `bookmark:${id}`)) || null });
+if (method === "PUT") {
+const body = await request.json();
+const mark = { chapter_idx: Number(body.chapter_idx) || 0, offset: Number(body.offset) || 0, updated_at: now() };
+await kvPut(env, `bookmark:${id}`, mark);
+return jsonResponse({ success: true, bookmark: mark });
+}
 }
 
 // 心情日历：GET 查范围，POST 记一笔（静怡走前端 who=yomi，Emet 走 MCP who=emet）
