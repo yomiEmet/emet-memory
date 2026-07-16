@@ -735,7 +735,17 @@ content: { type: "string" }
 { name: "feed_like", description: "给一条动态点赞；对同一条再调一次是取消赞。",
 inputSchema: { type: "object", properties: {
 feed_id: { type: "string" }
-}, required: ["feed_id"] } }
+}, required: ["feed_id"] } },
+{ name: "receipt_add", description: "帮静怡在「今日小票」上记一笔（像超市小票的每日清单）。只在她明确让你记的时候用——显式调用，不要自动扫描聊天内容替她记。",
+inputSchema: { type: "object", properties: {
+text: { type: "string", description: "要记的一条，比如：买牛奶 / 喝了三杯咖啡 / 给花浇水" }
+}, required: ["text"] } },
+{ name: "receipt_list", description: "看某天的今日小票。date 不传默认今天（按凌晨 4 点切日）。",
+inputSchema: { type: "object", properties: {
+date: { type: "string", description: "可选 YYYY-MM-DD" }
+} } },
+{ name: "period_status", description: "查静怡的经期状态：是否进行中、平均周期、预测下次日期、距今天数，附最近几次记录。数据由她在前端记录，你只读。",
+inputSchema: { type: "object", properties: {} } }
 ];
 
 // ─── 工具函数 ───
@@ -870,6 +880,70 @@ const page = before ? list.filter(f => (f.created_at || "") < before) : list;
 const capped = Math.max(1, Math.min(Number(limit) || 20, 50));
 const items = page.slice(0, capped);
 return { items, nextBefore: page.length > capped ? items[items.length - 1].created_at : null };
+}
+
+// ─── 今日小票（四期 4-1）：按 4 点逻辑日一个 KV ───
+// KV: receipt:<YYYY-MM-DD> = { day, items: [{ id, text, added_by: yomi|emet, created_at }] }
+function receiptDayCN(dateStr) {
+if (typeof dateStr === "string" && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+return logicalDayCN(); // 凌晨 4 点切
+}
+async function addReceiptItem(env, { text, added_by = "yomi", date }) {
+const day = receiptDayCN(date);
+const rec = (await kvGet(env, `receipt:${day}`)) || { day, items: [] };
+const item = { id: generateId(), text: String(text || "").slice(0, 200), added_by: added_by === "emet" ? "emet" : "yomi", created_at: now() };
+rec.items = [...(rec.items || []), item];
+await kvPut(env, `receipt:${day}`, rec);
+return { day, item };
+}
+
+// ─── 经期月历（四期 4-2）：统计只在后端实现一份，前端与工具都调它 ───
+// KV: period:<start_date> = { start_date, end_date|null, note, created_at, updated_at }
+// 谓词找进行中的那次一律 find(l => !l.end_date)，绝不取数组头部（乱序补记会卡死）
+function computePeriodStats(logs) {
+const valid = (logs || []).filter(l => l && /^\d{4}-\d{2}-\d{2}$/.test(l.start_date));
+valid.sort((a, b) => (a.start_date < b.start_date ? -1 : 1));
+const ongoing = valid.find(l => !l.end_date) || null;
+
+// 周期 = 相邻两次 start 间隔；离群值过滤（>120 天不进统计）
+const gaps = [];
+for (let i = 1; i < valid.length; i++) {
+const d = Math.round((parseYmdUTC(valid[i].start_date) - parseYmdUTC(valid[i - 1].start_date)) / 86400000);
+if (d > 0 && d <= 120) gaps.push(d);
+}
+const avgCycle = gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length) : null;
+
+// 经期长度（end-start），离群值过滤（>15 天不进统计）
+const durations = [];
+for (const l of valid) {
+if (l.end_date && /^\d{4}-\d{2}-\d{2}$/.test(l.end_date)) {
+const d = Math.round((parseYmdUTC(l.end_date) - parseYmdUTC(l.start_date)) / 86400000) + 1;
+if (d > 0 && d <= 15) durations.push(d);
+}
+}
+const avgDuration = durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : null;
+
+const last = valid[valid.length - 1] || null;
+let predictedNext = null, daysUntil = null;
+if (last && avgCycle) {
+const nextMs = parseYmdUTC(last.start_date) + avgCycle * 86400000;
+predictedNext = new Date(nextMs).toISOString().slice(0, 10);
+daysUntil = Math.round((nextMs - parseYmdUTC(logicalDayCN())) / 86400000);
+}
+return {
+count: valid.length,
+ongoing: ongoing ? { start_date: ongoing.start_date } : null,
+avg_cycle_days: avgCycle,
+avg_duration_days: avgDuration,
+last_start: last ? last.start_date : null,
+predicted_next: predictedNext,
+days_until_next: daysUntil,
+recent: valid.slice(-6).reverse(),
+};
+}
+function parseYmdUTC(s) {
+const [y, m, d] = s.split("-").map(Number);
+return Date.UTC(y, (m || 1) - 1, d || 1);
 }
 
 async function executeTool(name, args, env) {
@@ -1261,6 +1335,20 @@ item.likes.emet = !item.likes.emet;
 item.updated_at = now();
 await kvPut(env, `feed:${item.id}`, item);
 return { success: true, liked: item.likes.emet };
+}
+case "receipt_add": {
+if (!args.text || !String(args.text).trim()) return { error: "text 不能为空" };
+const { day, item } = await addReceiptItem(env, { text: String(args.text).trim(), added_by: "emet" });
+return { success: true, day, id: item.id };
+}
+case "receipt_list": {
+const day = receiptDayCN(args.date);
+const rec = (await kvGet(env, `receipt:${day}`)) || { day, items: [] };
+return { day, items: rec.items || [] };
+}
+case "period_status": {
+const logs = await kvListByPrefix(env, "period:");
+return computePeriodStats(logs);
 }
 case "mood_set": {
 const valMap = { happy: 0.8, calm: 0.3, heart: 0.7, excited: 0.9, sad: -0.6, anxious: -0.4, tired: -0.2 };
@@ -2011,6 +2099,57 @@ if (raw) { try { entries.push(JSON.parse(raw)); } catch { /* 坏行跳过 */ } }
 }
 const nextBefore = names.length > limit && entries.length ? entries[entries.length - 1].ts : null;
 return jsonResponse({ entries, next_before: nextBefore });
+}
+
+// ─── 今日小票（4-1）：GET 某天 / POST 加条目 / DELETE 删条目 ───
+if (path === "/api/receipt" && method === "GET") {
+const day = receiptDayCN(url.searchParams.get("date"));
+const rec = (await kvGet(env, `receipt:${day}`)) || { day, items: [] };
+return jsonResponse({ day, items: rec.items || [] });
+}
+if (path === "/api/receipt" && method === "POST") {
+const body = await request.json();
+if (!body.text || !String(body.text).trim()) return jsonResponse({ error: "text 不能为空" }, 400);
+const { day, item } = await addReceiptItem(env, { text: String(body.text).trim(), added_by: body.added_by, date: body.date });
+return jsonResponse({ success: true, day, item });
+}
+const receiptDelMatch = path.match(/^\/api\/receipt\/([^\/]+)\/([^\/]+)$/);
+if (receiptDelMatch && method === "DELETE") {
+const [, day, itemId] = receiptDelMatch;
+const rec = await kvGet(env, `receipt:${day}`);
+if (!rec) return jsonResponse({ error: "Not found" }, 404);
+rec.items = (rec.items || []).filter(i => i.id !== itemId);
+await kvPut(env, `receipt:${day}`, rec);
+return jsonResponse({ success: true, items: rec.items });
+}
+
+// ─── 经期月历（4-2）：GET 全部记录+统计 / POST 增改（含回溯补记）/ DELETE 删 ───
+// 统计只在后端一份（computePeriodStats），前端和 period_status 工具共用
+if (path === "/api/period" && method === "GET") {
+const logs = await kvListByPrefix(env, "period:");
+logs.sort((a, b) => (a.start_date < b.start_date ? 1 : -1));
+return jsonResponse({ logs, stats: computePeriodStats(logs) });
+}
+if (path === "/api/period" && method === "POST") {
+const body = await request.json();
+if (!body.start_date || !/^\d{4}-\d{2}-\d{2}$/.test(body.start_date)) return jsonResponse({ error: "start_date 必须是 YYYY-MM-DD" }, 400);
+if (body.end_date && !/^\d{4}-\d{2}-\d{2}$/.test(body.end_date)) return jsonResponse({ error: "end_date 格式错误" }, 400);
+const key = `period:${body.start_date}`;
+const existing = await kvGet(env, key);
+const rec = {
+start_date: body.start_date,
+end_date: body.end_date || null,
+note: typeof body.note === "string" ? body.note.slice(0, 200) : (existing?.note || ""),
+created_at: existing?.created_at || now(),
+updated_at: now(),
+};
+await kvPut(env, key, rec);
+return jsonResponse({ success: true, item: rec });
+}
+const periodDelMatch = path.match(/^\/api\/period\/([^\/]+)$/);
+if (periodDelMatch && method === "DELETE") {
+await kvDelete(env, `period:${periodDelMatch[1]}`);
+return jsonResponse({ success: true });
 }
 
 // 心情日历：GET 查范围，POST 记一笔（静怡走前端 who=yomi，Emet 走 MCP who=emet）
