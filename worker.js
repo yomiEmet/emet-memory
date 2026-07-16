@@ -918,11 +918,12 @@ return { day, item };
 
 // ─── 经期月历（四期 4-2）：统计只在后端实现一份，前端与工具都调它 ───
 // KV: period:<start_date> = { start_date, end_date|null, note, created_at, updated_at }
-// 谓词找进行中的那次一律 find(l => !l.end_date)，绝不取数组头部（乱序补记会卡死）
+// 进行中的那次 = 最近一次未结束的记录。valid 按 start 升序，故取"最后一条 open"（reverse 后 find），
+// 而非最早的 open——否则"漏记结束 + 又补记/新开一次"时 ongoing 会指向旧记录、结束按钮结错对象。
 function computePeriodStats(logs) {
 const valid = (logs || []).filter(l => l && /^\d{4}-\d{2}-\d{2}$/.test(l.start_date));
 valid.sort((a, b) => (a.start_date < b.start_date ? -1 : 1));
-const ongoing = valid.find(l => !l.end_date) || null;
+const ongoing = [...valid].reverse().find(l => !l.end_date) || null;
 
 // 周期 = 相邻两次 start 间隔；离群值过滤（>120 天不进统计）
 const gaps = [];
@@ -6109,6 +6110,7 @@ return jsonResponse({ error: "Not found" }, 404);
 // ─── 主入口 ───
 const ALLOWED_ORIGINS = [
 "https://emet-frontend.pages.dev",
+"https://emethome.com",
 "http://localhost:5173"
 ];
 
