@@ -7733,9 +7733,14 @@ return jsonResponse({ record: await getLatestHealth(env) });
 }
 
 // ── GET /api/health/context：给 AI 的自然语言健康摘要 ──
+// 只认"当天或昨天"的数据：快捷指令停推后 getLatestHealth 会一直拿着陈旧记录，
+// 曾把一个月前的"身体应激状态；今天活动量很少"当今天的事天天注入聊天。过期一律不给。
 if (path === "/api/health/context" && method === "GET") {
 const rec = await getLatestHealth(env);
-return jsonResponse({ date: rec?.date || null, context: buildHealthContext(rec) });
+const today = cnToday();
+const yesterday = new Date(Date.now() + 8 * 3600 * 1000 - 86400 * 1000).toISOString().slice(0, 10);
+const fresh = rec && (rec.date === today || rec.date === yesterday);
+return jsonResponse({ date: rec?.date || null, stale: !!(rec && !fresh), context: fresh ? buildHealthContext(rec) : "" });
 }
 
 return jsonResponse({ error: "Not found" }, 404);
@@ -8392,10 +8397,14 @@ try {
 } catch { /* 读不到就不带设备信息 */ }
 
 // 读取健康数据（步数、心率、HRV、睡眠）
+// 同 /api/health/context 的新鲜度闸：只认当天/昨天，陈旧数据不然会被当
+// "今天走了X步/昨晚睡了X小时"说出口（快捷指令停推后曾拿一个月前的数据天天说）
 let healthHint = "";
 try {
   const rec = await getLatestHealth(env);
-  if (rec) {
+  const hToday = cnToday();
+  const hYesterday = new Date(Date.now() + 8 * 3600 * 1000 - 86400 * 1000).toISOString().slice(0, 10);
+  if (rec && (rec.date === hToday || rec.date === hYesterday)) {
     const parts = [];
     if (typeof rec.steps === "number") parts.push(`今天走了 ${rec.steps} 步`);
     if (typeof rec.heart_rate === "number") parts.push(`心率 ${Math.round(rec.heart_rate)}`);
