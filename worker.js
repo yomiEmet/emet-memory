@@ -2360,6 +2360,42 @@ return jsonResponse(await executeTool("mood_set", body, env));
 }
 }
 
+// 喝水/运动：轻量日计数，直接 KV 存取（不走 MCP tool）
+// GET /api/water?date=YYYY-MM-DD  → { date, count }
+// POST /api/water { date, count } → { success, date, count }
+if (path === "/api/water") {
+if (method === "GET") {
+const date = url.searchParams.get("date");
+if (!date) return jsonResponse({ error: "date required" }, 400);
+const val = await kvGet(env, `water:${date}`);
+return jsonResponse(val || { date, count: 0 });
+}
+if (method === "POST") {
+const body = await request.json();
+if (!body.date) return jsonResponse({ error: "date required" }, 400);
+const rec = { date: body.date, count: Number(body.count) || 0, updated_at: now() };
+await kvPut(env, `water:${body.date}`, rec);
+return jsonResponse({ success: true, ...rec });
+}
+}
+// GET /api/exercise?date=YYYY-MM-DD  → { date, minutes }
+// POST /api/exercise { date, minutes } → { success, date, minutes }
+if (path === "/api/exercise") {
+if (method === "GET") {
+const date = url.searchParams.get("date");
+if (!date) return jsonResponse({ error: "date required" }, 400);
+const val = await kvGet(env, `exercise:${date}`);
+return jsonResponse(val || { date, minutes: 0 });
+}
+if (method === "POST") {
+const body = await request.json();
+if (!body.date) return jsonResponse({ error: "date required" }, 400);
+const rec = { date: body.date, minutes: Number(body.minutes) || 0, updated_at: now() };
+await kvPut(env, `exercise:${body.date}`, rec);
+return jsonResponse({ success: true, ...rec });
+}
+}
+
 // 跨模块搬移（前端三点菜单"移动到…"用）
 if (path === "/api/move" && method === "POST") {
 const body = await request.json();
