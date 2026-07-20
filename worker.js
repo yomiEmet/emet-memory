@@ -1734,15 +1734,24 @@ return new Response(bytes, { headers: { "Content-Type": "image/png", "Cache-Cont
 if (path === "/health") return jsonResponse({ status: "ok", version: "6.8.2", timestamp: now() });
 
 if (path === "/api/data" && method === "GET") {
-const memories = await kvListByPrefix(env, "mem:");
-const moments = await kvListByPrefix(env, "mom:");
-const diaries = await kvListByPrefix(env, "diary:");
-const messages = await kvListByPrefix(env, "msg:");
-const handoffs = await kvListByPrefix(env, "handoff:");
-const ideas = await kvListByPrefix(env, "idea:");
+// 一把拉全部 7 类会做 ~(总记录数+7) 个 KV 子请求；数据涨到 1000+ 就撞 Worker 的
+// 单次调用子请求上限(1000)→整个接口 1101 崩。改成支持 ?only=<类> 单类拉取，
+// 前端并行拉 7 次（每次独立 Worker 调用、各有独立 1000 额度）。无 only 参数时
+// 仍按老行为拉全部（小数据部署/向后兼容；大数据部署前端一律带 only）。
+const only = url.searchParams.get("only");
+const want = (name) => !only || only === name;
+const out = {};
+if (want("memories")) out.memories = await kvListByPrefix(env, "mem:");
+if (want("moments")) out.moments = await kvListByPrefix(env, "mom:");
+if (want("diaries")) out.diaries = await kvListByPrefix(env, "diary:");
+if (want("messages")) out.messages = await kvListByPrefix(env, "msg:");
+if (want("handoffs")) out.handoffs = await kvListByPrefix(env, "handoff:");
+if (want("ideas")) out.ideas = await kvListByPrefix(env, "idea:");
+if (want("games")) {
 const games = await kvListByPrefix(env, "game:");
-const gameList = games.map(g => ({ id: g.id, name: g.name, name_zh: g.name_zh, description: g.description, created_at: g.created_at }));
-return jsonResponse({ memories, moments, diaries, messages, handoffs, ideas, games: gameList });
+out.games = games.map(g => ({ id: g.id, name: g.name, name_zh: g.name_zh, description: g.description, created_at: g.created_at }));
+}
+return jsonResponse(out);
 }
 if (path === "/api/backup" && method === "GET") return jsonResponse(await executeTool("backup_export", {}, env));
 if (path === "/api/stats" && method === "GET") return jsonResponse(await executeTool("stats", {}, env));
@@ -1958,15 +1967,24 @@ return new Response(bytes, { headers: { "Content-Type": "image/png", "Cache-Cont
 if (path === "/health") return jsonResponse({ status: "ok", version: "6.8.2", timestamp: now() });
 
 if (path === "/api/data" && method === "GET") {
-const memories = await kvListByPrefix(env, "mem:");
-const moments = await kvListByPrefix(env, "mom:");
-const diaries = await kvListByPrefix(env, "diary:");
-const messages = await kvListByPrefix(env, "msg:");
-const handoffs = await kvListByPrefix(env, "handoff:");
-const ideas = await kvListByPrefix(env, "idea:");
+// 一把拉全部 7 类会做 ~(总记录数+7) 个 KV 子请求；数据涨到 1000+ 就撞 Worker 的
+// 单次调用子请求上限(1000)→整个接口 1101 崩。改成支持 ?only=<类> 单类拉取，
+// 前端并行拉 7 次（每次独立 Worker 调用、各有独立 1000 额度）。无 only 参数时
+// 仍按老行为拉全部（小数据部署/向后兼容；大数据部署前端一律带 only）。
+const only = url.searchParams.get("only");
+const want = (name) => !only || only === name;
+const out = {};
+if (want("memories")) out.memories = await kvListByPrefix(env, "mem:");
+if (want("moments")) out.moments = await kvListByPrefix(env, "mom:");
+if (want("diaries")) out.diaries = await kvListByPrefix(env, "diary:");
+if (want("messages")) out.messages = await kvListByPrefix(env, "msg:");
+if (want("handoffs")) out.handoffs = await kvListByPrefix(env, "handoff:");
+if (want("ideas")) out.ideas = await kvListByPrefix(env, "idea:");
+if (want("games")) {
 const games = await kvListByPrefix(env, "game:");
-const gameList = games.map(g => ({ id: g.id, name: g.name, name_zh: g.name_zh, description: g.description, created_at: g.created_at }));
-return jsonResponse({ memories, moments, diaries, messages, handoffs, ideas, games: gameList });
+out.games = games.map(g => ({ id: g.id, name: g.name, name_zh: g.name_zh, description: g.description, created_at: g.created_at }));
+}
+return jsonResponse(out);
 }
 if (path === "/api/backup" && method === "GET") return jsonResponse(await executeTool("backup_export", {}, env));
 if (path === "/api/stats" && method === "GET") return jsonResponse(await executeTool("stats", {}, env));
