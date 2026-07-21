@@ -1437,7 +1437,20 @@ return { annotations: list };
 }
 case "mood_set": {
 const valMap = { happy: 0.8, calm: 0.3, heart: 0.7, excited: 0.9, sad: -0.6, anxious: -0.4, tired: -0.2 };
-if (!valMap.hasOwnProperty(args.mood)) return { error: "未知心情: " + args.mood };
+// 两条写入路径：① 静怡新版发愉悦度 level(1-7)，valence 均匀 -1..1；② Emet/旧数据发具名 mood。
+let mood = args.mood ?? null;
+let level = null;
+let valence;
+const lvl = Number(args.level);
+if (Number.isInteger(lvl) && lvl >= 1 && lvl <= 7) {
+  level = lvl;
+  valence = (lvl - 4) / 3;
+  mood = null; // 愉悦度记录不再绑具名心情
+} else if (valMap.hasOwnProperty(args.mood)) {
+  valence = valMap[args.mood];
+} else {
+  return { error: "未知心情: " + args.mood + "（需 mood 七选一或 level 1-7）" };
+}
 const who = args.who === "yomi" ? "yomi" : "emet";
 const date = (typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date))
   ? args.date
@@ -1445,13 +1458,13 @@ const date = (typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.d
 const key = `mood:${date}:${who}`;
 const existing = await kvGet(env, key);
 const entry = {
-  date, who, mood: args.mood, note: args.note || "",
-  valence: valMap[args.mood],
+  date, who, mood, level, note: args.note || "",
+  valence,
   created_at: existing?.created_at || now(),
   updated_at: now(),
 };
 await kvPut(env, key, entry);
-return { success: true, date, who, mood: args.mood };
+return { success: true, date, who, mood, level };
 }
 case "mood_list": {
 const all = await kvListByPrefix(env, "mood:");
@@ -1646,7 +1659,9 @@ const ideas = await kvListByPrefix(env, "idea:");
 const games = await kvListByPrefix(env, "game:");
 const water = await kvListByPrefix(env, "water:");
 const exercise = await kvListByPrefix(env, "exercise:");
-return { exported_at: now(), data: { memories, moments, diaries, messages, handoffs, ideas, games, water, exercise } };
+const moods = await kvListByPrefix(env, "mood:");
+const emotions = await kvListByPrefix(env, "emotion:");
+return { exported_at: now(), data: { memories, moments, diaries, messages, handoffs, ideas, games, water, exercise, moods, emotions } };
 }
 default:
 return { error: `未知工具: ${name}` };
@@ -2395,6 +2410,52 @@ if (!body.date) return jsonResponse({ error: "date required" }, 400);
 const rec = { date: body.date, minutes: Number(body.minutes) || 0, updated_at: now() };
 await kvPut(env, `exercise:${body.date}`, rec);
 return jsonResponse({ success: true, ...rec });
+}
+}
+
+// 情绪：当下感受，一天可多条带时间（区别于 mood 每天一条整体心情）。
+// 存 emotion:<date> = { entries: [{id, who, date, ts, level, valence, note}] }
+// GET /api/emotion?start&end → { emotions: [...] }（按 ts 倒序）
+// POST /api/emotion { level(1-7), note, date, who } → { success, entry }
+if (path === "/api/emotion") {
+if (method === "GET") {
+const start = url.searchParams.get("start");
+const end = url.searchParams.get("end");
+const days = await kvListByPrefix(env, "emotion:");
+let entries = [];
+for (const d of days) if (d && Array.isArray(d.entries)) entries.push(...d.entries);
+if (start) entries = entries.filter(e => e.date >= start);
+if (end) entries = entries.filter(e => e.date <= end);
+entries.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+return jsonResponse({ emotions: entries });
+}
+if (method === "POST") {
+const body = await request.json();
+const lvl = Number(body.level);
+if (!(Number.isInteger(lvl) && lvl >= 1 && lvl <= 7)) return jsonResponse({ error: "level 必须 1-7" }, 400);
+const who = body.who === "emet" ? "emet" : "yomi";
+const date = (typeof body.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.date))
+  ? body.date
+  : cnNow().toISOString().slice(0, 10);
+const key = `emotion:${date}`;
+const rec = (await kvGet(env, key)) || { entries: [] };
+if (!Array.isArray(rec.entries)) rec.entries = [];
+const entry = { id: generateId(), who, date, ts: now(), level: lvl, valence: (lvl - 4) / 3, note: body.note || "" };
+rec.entries.push(entry);
+await kvPut(env, key, rec);
+return jsonResponse({ success: true, entry });
+}
+if (method === "DELETE") {
+const id = url.searchParams.get("id");
+const date = url.searchParams.get("date");
+if (!id || !date) return jsonResponse({ error: "id/date required" }, 400);
+const key = `emotion:${date}`;
+const rec = await kvGet(env, key);
+if (rec && Array.isArray(rec.entries)) {
+  rec.entries = rec.entries.filter(e => e.id !== id);
+  await kvPut(env, key, rec);
+}
+return jsonResponse({ success: true });
 }
 }
 
