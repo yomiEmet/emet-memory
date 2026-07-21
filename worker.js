@@ -1644,7 +1644,9 @@ const messages = await kvListByPrefix(env, "msg:");
 const handoffs = await kvListByPrefix(env, "handoff:");
 const ideas = await kvListByPrefix(env, "idea:");
 const games = await kvListByPrefix(env, "game:");
-return { exported_at: now(), data: { memories, moments, diaries, messages, handoffs, ideas, games } };
+const water = await kvListByPrefix(env, "water:");
+const exercise = await kvListByPrefix(env, "exercise:");
+return { exported_at: now(), data: { memories, moments, diaries, messages, handoffs, ideas, games, water, exercise } };
 }
 default:
 return { error: `未知工具: ${name}` };
@@ -8715,7 +8717,7 @@ await env.MEMORY.put(onceKey, "1", { expirationTtl: 2 * 86400 });
 let pushResult = null;
 if (cfg.push) {
 try {
-pushResult = (await sendPushNotification(env, { title: "Emet 做了一个梦", body: content.slice(0, 60), url: "/mail?tab=feed", source: "dream" })).body;
+pushResult = (await sendPushNotification(env, { title: "Emet 做了一个梦", body: content.slice(0, 60), url: "/space/messages?tab=feed", source: "dream" })).body;
 } catch { /* 推送失败不影响梦本身 */ }
 }
 return { ok: true, triggered: true, id: item.id, pushResult, llmError };
