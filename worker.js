@@ -8469,6 +8469,15 @@ if (settings.chatTarget?.providerId) {
 p = enabled.find(x => x.id === settings.chatTarget.providerId);
 }
 if (!p) p = enabled[0];
+// 云端 worker 的 fetch 永远到不了 localhost/内网（CF error 1003）——「本机 Claude（订阅）」
+// 只有浏览器/手机中转够得着。聊天目标选了它时，后台任务（心跳/独处/做梦/朋友圈反应/摘要）
+// 自动退回下一个公网可达的 enabled provider，否则这些任务会全部静默挂掉（2026-07-22 实测）。
+const isLocalUrl = (u) => /^https?:\/\/(localhost|127\.|0\.0\.0\.0|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(String(u || ""));
+if (isLocalUrl(p.baseUrl)) {
+const pub = enabled.find(x => !isLocalUrl(x.baseUrl));
+if (!pub) throw new Error("no reachable provider: 只启用了本机供应商，云端后台任务够不着它");
+p = pub;
+}
 const targetModel = (p.id === settings.chatTarget?.providerId && settings.chatTarget?.model) ? settings.chatTarget.model : null;
 const model = targetModel && p.models?.includes(targetModel)
 ? targetModel
