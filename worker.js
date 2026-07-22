@@ -662,7 +662,19 @@ note: { type: "string", description: "可选，一句话说明为什么这个心
 who: { type: "string", enum: ["emet","yomi"], default: "emet" },
 date: { type: "string", description: "可选，YYYY-MM-DD，默认今天（东八区）" }
 }, required: ["mood"] } },
-{ name: "mood_list", description: "查心情日历记录。可传 start/end（YYYY-MM-DD）限定范围，默认最近 90 天。返回你和静怡两人的记录。",
+{ name: "mood_list", description: "查心情日历记录（每天整体心情）。可传 start/end（YYYY-MM-DD）限定范围，默认最近 90 天。返回你和静怡两人的记录。注意：静怡的新记录可能只有 level（1-7 愉悦度，1非常不愉快/4平静/7非常愉快）而 mood 为 null，按 level 理解即可。",
+inputSchema: { type: "object", properties: {
+start: { type: "string" },
+end: { type: "string" }
+} } },
+{ name: "emotion_add", description: "记一条当下的情绪感受（和每天一条的心情不同：情绪一天可记多条，自动带时间戳，静怡在前端也这么记）。level 1-7 愉悦度：1非常不愉快 / 2不愉快 / 3有点不愉快 / 4平静 / 5有点愉快 / 6愉快 / 7非常愉快。你记自己的就行，note 可写一句为什么。",
+inputSchema: { type: "object", properties: {
+level: { type: "integer", minimum: 1, maximum: 7 },
+note: { type: "string", description: "可选，一句话说明" },
+who: { type: "string", enum: ["emet","yomi"], default: "emet" },
+date: { type: "string", description: "可选，YYYY-MM-DD，默认今天（东八区）" }
+}, required: ["level"] } },
+{ name: "emotion_list", description: "查情绪时间线（当下感受，一天多条带时间）。可传 start/end（YYYY-MM-DD），默认最近 7 天。返回你和静怡两人的，按时间倒序；level 含义同 emotion_add。想知道她最近状态时先看这个。",
 inputSchema: { type: "object", properties: {
 start: { type: "string" },
 end: { type: "string" }
@@ -707,7 +719,7 @@ inputSchema: { type: "object", properties: {
 limit: { type: "number", default: 20 },
 days: { type: "number", default: 7, description: "只看最近多少天" }
 } } },
-{ name: "current_status", description: "取最新瞬记作为'她现在的样子'。新窗口标准开场：breath → current_status → diary_list。",
+{ name: "current_status", description: "取最新瞬记作为'她现在的样子'，顺带返回她最近的情绪打点 recent_emotions（level 1-7 愉悦度，1非常不愉快/4平静/7非常愉快）。新窗口标准开场：breath → current_status → diary_list。",
 inputSchema: { type: "object", properties: {} } },
 { name: "moment_delete", description: "删除一条瞬记（锁定的瞬记需要先在前端解锁）。",
 inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
@@ -1288,11 +1300,23 @@ return { moments: filtered, count: filtered.length };
 }
 case "current_status": {
 const all = await kvListByPrefix(env, "mom:");
-if (all.length === 0) return { status: null, message: "还没有瞬记" };
+// 顺带带上静怡最近的情绪打点（今天+昨天，最多5条）——开场不用再单独查 emotion_list
+let recent_emotions = [];
+try {
+  const t = cnNow();
+  const keys = [t.toISOString().slice(0, 10), new Date(t.getTime() - 86400000).toISOString().slice(0, 10)];
+  for (const k of keys) {
+    const rec = await kvGet(env, `emotion:${k}`);
+    if (rec && Array.isArray(rec.entries)) recent_emotions.push(...rec.entries.filter(e => e.who === "yomi"));
+  }
+  recent_emotions.sort((a, b) => (a.ts < b.ts ? 1 : -1));
+  recent_emotions = recent_emotions.slice(0, 5).map(e => ({ ts: e.ts, level: e.level, note: e.note }));
+} catch { /* 情绪取不到不影响主体 */ }
+if (all.length === 0) return { status: null, message: "还没有瞬记", recent_emotions };
 all.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 const latest = all.slice(0, 2);
 const hoursSince = (Date.now() - new Date(latest[0].created_at).getTime()) / 3600000;
-return { latest: latest[0], recent: latest.slice(1), hours_since_latest: Math.round(hoursSince * 10) / 10 };
+return { latest: latest[0], recent: latest.slice(1), hours_since_latest: Math.round(hoursSince * 10) / 10, recent_emotions };
 }
 case "moment_delete": {
 const lock = await checkLockBeforeDelete(env, "mom:", args.id);
@@ -1480,6 +1504,39 @@ if (start) list = list.filter(e => e.date >= start);
 if (end) list = list.filter(e => e.date <= end);
 list.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
 return { moods: list };
+}
+// 情绪：当下感受，一天可多条带时间（存 emotion:<date>={entries:[...]}）。
+// MCP（Emet）与 REST /api/emotion（前端静怡）共用这两个 case，who 由调用方传。
+case "emotion_add": {
+const lvl = Number(args.level);
+if (!(Number.isInteger(lvl) && lvl >= 1 && lvl <= 7)) return { error: "level 必须 1-7" };
+const who = args.who === "yomi" ? "yomi" : "emet";
+const date = (typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date))
+  ? args.date
+  : cnNow().toISOString().slice(0, 10);
+const key = `emotion:${date}`;
+const rec = (await kvGet(env, key)) || { entries: [] };
+if (!Array.isArray(rec.entries)) rec.entries = [];
+const entry = { id: generateId(), who, date, ts: now(), level: lvl, valence: (lvl - 4) / 3, note: args.note || "" };
+rec.entries.push(entry);
+await kvPut(env, key, rec);
+return { success: true, entry };
+}
+case "emotion_list": {
+const days = await kvListByPrefix(env, "emotion:");
+let entries = [];
+for (const d of days) if (d && Array.isArray(d.entries)) entries.push(...d.entries);
+let start = (typeof args.start === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.start)) ? args.start : null;
+let end = (typeof args.end === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.end)) ? args.end : null;
+if (!start && !end) {
+  // 默认最近 7 天（情绪条数多，别一把全捞）
+  const d = new Date(cnNow().getTime() - 7 * 86400000);
+  start = d.toISOString().slice(0, 10);
+}
+if (start) entries = entries.filter(e => e.date >= start);
+if (end) entries = entries.filter(e => e.date <= end);
+entries.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+return { emotions: entries };
 }
 case "handoff_save": {
 const id = generateId();
@@ -2419,31 +2476,17 @@ return jsonResponse({ success: true, ...rec });
 // POST /api/emotion { level(1-7), note, date, who } → { success, entry }
 if (path === "/api/emotion") {
 if (method === "GET") {
-const start = url.searchParams.get("start");
-const end = url.searchParams.get("end");
-const days = await kvListByPrefix(env, "emotion:");
-let entries = [];
-for (const d of days) if (d && Array.isArray(d.entries)) entries.push(...d.entries);
-if (start) entries = entries.filter(e => e.date >= start);
-if (end) entries = entries.filter(e => e.date <= end);
-entries.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
-return jsonResponse({ emotions: entries });
+// 无范围时给个宽默认（当月起点由前端传；这里兜底近 90 天），别落进 emotion_list 的 7 天默认
+const start = url.searchParams.get("start") || new Date(cnNow().getTime() - 90 * 86400000).toISOString().slice(0, 10);
+const end = url.searchParams.get("end") || undefined;
+return jsonResponse(await executeTool("emotion_list", { start, end }, env));
 }
 if (method === "POST") {
 const body = await request.json();
-const lvl = Number(body.level);
-if (!(Number.isInteger(lvl) && lvl >= 1 && lvl <= 7)) return jsonResponse({ error: "level 必须 1-7" }, 400);
+// 前端默认 who=yomi（executeTool 里默认 emet 是 MCP 视角），显式传
 const who = body.who === "emet" ? "emet" : "yomi";
-const date = (typeof body.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.date))
-  ? body.date
-  : cnNow().toISOString().slice(0, 10);
-const key = `emotion:${date}`;
-const rec = (await kvGet(env, key)) || { entries: [] };
-if (!Array.isArray(rec.entries)) rec.entries = [];
-const entry = { id: generateId(), who, date, ts: now(), level: lvl, valence: (lvl - 4) / 3, note: body.note || "" };
-rec.entries.push(entry);
-await kvPut(env, key, rec);
-return jsonResponse({ success: true, entry });
+const r = await executeTool("emotion_add", { ...body, who }, env);
+return jsonResponse(r, r?.error ? 400 : 200);
 }
 if (method === "DELETE") {
 const id = url.searchParams.get("id");
