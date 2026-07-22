@@ -679,13 +679,23 @@ inputSchema: { type: "object", properties: {
 start: { type: "string" },
 end: { type: "string" }
 } } },
-{ name: "handoff_save", description: "保存交接信。",
+{ name: "life_daily", description: "查静怡某天的生活打卡：喝水（0-7 杯）和运动（分钟），她在主页记录。date 默认今天（凌晨4点切天）。",
+inputSchema: { type: "object", properties: {
+date: { type: "string", description: "可选，YYYY-MM-DD" }
+} } },
+{ name: "handoff_save", description: "写信（信件页与静怡共用）。kind=handoff 交接信（默认，写给下个窗口的你）；kind=daily 日常信（写给静怡，她在 空间→信件 里看，可带 title）。",
 inputSchema: { type: "object", properties: {
 content: { type: "string" },
+title: { type: "string", description: "可选，日常信标题" },
+kind: { type: "string", enum: ["handoff","daily"], default: "handoff" },
 window_from: { type: "string" },
 window_to: { type: "string", default: "next" }
 }, required: ["content"] } },
-{ name: "handoff_read", description: "读取最新交接信。", inputSchema: { type: "object", properties: { limit: { type: "number", default: 1 } } } },
+{ name: "handoff_read", description: "读信件。交接信和日常信共用一张表：kind=handoff 只看交接信 / kind=daily 只看日常信（静怡写给你的都在这，别漏）/ 不传=全部。limit 默认 3。",
+inputSchema: { type: "object", properties: {
+kind: { type: "string", enum: ["handoff","daily","all"], default: "all" },
+limit: { type: "number", default: 3 }
+} } },
 { name: "breath", description: "浮现记忆。无参数返回最高权重的未解决记忆。",
 inputSchema: { type: "object", properties: { query: { type: "string" }, limit: { type: "number", default: 5 } } } },
 { name: "idea_save", description: "记下一个灵感（创作模块用）。",
@@ -719,7 +729,7 @@ inputSchema: { type: "object", properties: {
 limit: { type: "number", default: 20 },
 days: { type: "number", default: 7, description: "只看最近多少天" }
 } } },
-{ name: "current_status", description: "取最新瞬记作为'她现在的样子'，顺带返回她最近的情绪打点 recent_emotions（level 1-7 愉悦度，1非常不愉快/4平静/7非常愉快）。新窗口标准开场：breath → current_status → diary_list。",
+{ name: "current_status", description: "取最新瞬记作为'她现在的样子'，顺带返回她最近的情绪打点 recent_emotions（level 1-7 愉悦度，1非常不愉快/4平静/7非常愉快）和今天的生活打卡 life（喝水杯数/运动分钟）。新窗口标准开场：breath → current_status → diary_list。",
 inputSchema: { type: "object", properties: {} } },
 { name: "moment_delete", description: "删除一条瞬记（锁定的瞬记需要先在前端解锁）。",
 inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
@@ -1300,23 +1310,27 @@ return { moments: filtered, count: filtered.length };
 }
 case "current_status": {
 const all = await kvListByPrefix(env, "mom:");
-// 顺带带上静怡最近的情绪打点（今天+昨天，最多5条）——开场不用再单独查 emotion_list
+// 顺带带上静怡最近的情绪打点（逻辑今天+昨天，最多5条）和今天的喝水/运动——开场一眼见她状态
 let recent_emotions = [];
+let life = null;
 try {
-  const t = cnNow();
-  const keys = [t.toISOString().slice(0, 10), new Date(t.getTime() - 86400000).toISOString().slice(0, 10)];
-  for (const k of keys) {
+  const k0 = logicalToday();
+  const k1 = new Date(new Date(k0 + "T00:00:00Z").getTime() - 86400000).toISOString().slice(0, 10);
+  for (const k of [k0, k1]) {
     const rec = await kvGet(env, `emotion:${k}`);
     if (rec && Array.isArray(rec.entries)) recent_emotions.push(...rec.entries.filter(e => e.who === "yomi"));
   }
   recent_emotions.sort((a, b) => (a.ts < b.ts ? 1 : -1));
   recent_emotions = recent_emotions.slice(0, 5).map(e => ({ ts: e.ts, level: e.level, note: e.note }));
-} catch { /* 情绪取不到不影响主体 */ }
-if (all.length === 0) return { status: null, message: "还没有瞬记", recent_emotions };
+  const water = await kvGet(env, `water:${k0}`);
+  const exercise = await kvGet(env, `exercise:${k0}`);
+  life = { date: k0, water: water?.count || 0, exercise_minutes: exercise?.minutes || 0 };
+} catch { /* 附带信息取不到不影响主体 */ }
+if (all.length === 0) return { status: null, message: "还没有瞬记", recent_emotions, life };
 all.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 const latest = all.slice(0, 2);
 const hoursSince = (Date.now() - new Date(latest[0].created_at).getTime()) / 3600000;
-return { latest: latest[0], recent: latest.slice(1), hours_since_latest: Math.round(hoursSince * 10) / 10, recent_emotions };
+return { latest: latest[0], recent: latest.slice(1), hours_since_latest: Math.round(hoursSince * 10) / 10, recent_emotions, life };
 }
 case "moment_delete": {
 const lock = await checkLockBeforeDelete(env, "mom:", args.id);
@@ -1478,7 +1492,7 @@ if (Number.isInteger(lvl) && lvl >= 1 && lvl <= 7) {
 const who = args.who === "yomi" ? "yomi" : "emet";
 const date = (typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date))
   ? args.date
-  : cnNow().toISOString().slice(0, 10);
+  : logicalToday(); // 凌晨0-4点记的算前一天（全站逻辑日铁律）
 const key = `mood:${date}:${who}`;
 const existing = await kvGet(env, key);
 const entry = {
@@ -1513,7 +1527,7 @@ if (!(Number.isInteger(lvl) && lvl >= 1 && lvl <= 7)) return { error: "level 必
 const who = args.who === "yomi" ? "yomi" : "emet";
 const date = (typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date))
   ? args.date
-  : cnNow().toISOString().slice(0, 10);
+  : logicalToday();
 const key = `emotion:${date}`;
 const rec = (await kvGet(env, key)) || { entries: [] };
 if (!Array.isArray(rec.entries)) rec.entries = [];
@@ -1538,24 +1552,38 @@ if (end) entries = entries.filter(e => e.date <= end);
 entries.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
 return { emotions: entries };
 }
+case "life_daily": {
+const date = (typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date))
+  ? args.date
+  : logicalToday();
+const water = await kvGet(env, `water:${date}`);
+const exercise = await kvGet(env, `exercise:${date}`);
+return { date, water: water?.count || 0, exercise_minutes: exercise?.minutes || 0 };
+}
 case "handoff_save": {
 const id = generateId();
+const kind = args.kind === "daily" ? "daily" : "handoff";
 const handoff = {
 id, type: "handoff",
 content: args.content,
+title: args.title || "",
 window_from: args.window_from || "unknown",
 window_to: args.window_to || "next",
-kind: "handoff",
+kind,
 locked: false,
 created_at: now()
 };
 await kvPut(env, `handoff:${id}`, handoff);
-return { success: true, id };
+return { success: true, id, kind };
 }
 case "handoff_read": {
 const all = await kvListByPrefix(env, "handoff:");
-all.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-return { handoffs: all.slice(0, args.limit || 1) };
+// kind: handoff=交接信 / daily=日常信 / all=全部（默认）。旧数据缺 kind 视为交接信。
+let list = all;
+if (args.kind === "handoff") list = all.filter(h => (h.kind || "handoff") === "handoff");
+else if (args.kind === "daily") list = all.filter(h => h.kind === "daily");
+list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+return { handoffs: list.slice(0, args.limit || 3) };
 }
 case "breath": {
 const all = await kvListByPrefix(env, "mem:");
@@ -6271,6 +6299,7 @@ return jsonResponse({ error: "Not found" }, 404);
 const ALLOWED_ORIGINS = [
 "https://emet-frontend.pages.dev",
 "https://emethome.com",
+"https://cc.emethome.com",
 "http://localhost:5173"
 ];
 
@@ -8000,6 +8029,10 @@ return jsonResponse({ error: "Not found" }, 404);
 // 东八区当前时间（worker 默认 UTC，加 +8h 偏移）
 function cnNow() {
 return new Date(Date.now() + 8 * 3600 * 1000);
+}
+// 逻辑日（凌晨4点切天，全站铁律）：按日归属的默认日期一律用这个，别用 cnNow 的自然日
+function logicalToday() {
+return new Date(Date.now() + 8 * 3600 * 1000 - 4 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
 // "HH:MM"（东八区）
