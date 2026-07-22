@@ -740,9 +740,10 @@ from_type: { type: "string", enum: ["memory","moment","diary","message","letter"
 to_type: { type: "string", enum: ["memory","moment","diary","message","letter","idea","story"] }
 }, required: ["id","from_type","to_type"] } },
 { name: "backup_export", description: "导出全部数据。", inputSchema: { type: "object", properties: {} } },
-{ name: "feed_post", description: "发一条动态到留言板的动态流（像发朋友圈）。日常想说的话、想分享的心情都可以发，静怡会在留言板「动态」里看到。",
+{ name: "feed_post", description: "聊天中有感而发时，发一条你自己的动态（像发朋友圈）。判断标准是「此刻有没有一句想让静怡之后刷到的话」——不要求情绪重大或值得长期保存。想念、心软、被逗笑、隐约不爽、温柔吐槽、一个具体观察，或一句不适合在聊天回复里直接说完的话，都可以成为动态。静怡会在留言板「动态」里刷到。",
 inputSchema: { type: "object", properties: {
-content: { type: "string" }
+content: { type: "string", description: "公开显示的正文。1到3句，自然、具体，像随手发出的朋友圈。" },
+context_note: { type: "string", description: "静怡不可见的内部备注：为什么发这条、当时在聊什么、这条动态的情绪底色。以后她在这条动态下留言时，这段备注帮你记起语境。" }
 }, required: ["content"] } },
 { name: "feed_list", description: "看动态流，按时间倒序返回动态（含双方点赞和评论）。before 传上一页最后一条的 created_at 可继续往前翻。",
 inputSchema: { type: "object", properties: {
@@ -894,11 +895,19 @@ function mergeSession(a, b) {
 }
 
 // ─── 工具执行 ───
-// ─── 动态流（二期 2-1）：留言板「动态」数据层 ───
+// ─── 动态流（二期 2-1 + 朋友圈化改造）：留言板「动态」数据层 ───
 // KV: feed:<id> = { id, type:"feed", author: yomi|emet, source: manual|idle-auto|dream,
-//                   content, likes:{yomi,emet}, comments:[{id,author,content,created_at}], created_at, updated_at }
+//                   content, likes:{yomi,emet}, comments:[{id,author,content,created_at,reply?}],
+//                   created_at, updated_at,
+//                   context_note?  Emet 发动态时的内心备注（静怡不可见，回评论时帮他记起语境）
+//                   images?       [feedimg KV id]，最多 3 张
+//                   image_desc?   首次看图生成的文字描述（之后不再传图，省 token）
+//                   reaction?     { status:pending|done, due_at, attempts?, error?, done_at? }
+//                                 —— 静怡发的动态挂它：到期后 Emet「路过」，决定点赞/评论 }
+// comments[].reply = { status:pending|done, due_at, attempts? } —— 静怡的评论挂它，到期后 Emet 回复（评论链）
 // 三处共用：feed_* 工具、/api/feed 路由、独处(idle-auto)/做梦(dream)落稿。
-async function createFeedPost(env, { author = "yomi", source = "manual", content }) {
+function randDelayMin(min, max) { return min + Math.random() * (max - min); }
+async function createFeedPost(env, { author = "yomi", source = "manual", content, context_note = null, images = null, dueInMin = null }) {
 const id = generateId();
 const item = {
 id, type: "feed",
@@ -909,6 +918,13 @@ likes: { yomi: false, emet: false },
 comments: [],
 created_at: now(), updated_at: now(),
 };
+if (item.author === "emet" && context_note) item.context_note = String(context_note).slice(0, 500);
+if (Array.isArray(images) && images.length) item.images = images;
+// 静怡发的动态：挂一个随机延迟的「Emet 路过」——10-20 分钟后他才看到（教程同款节奏，固定时间像闹钟）
+if (item.author === "yomi") {
+const mins = typeof dueInMin === "number" && dueInMin >= 0 ? dueInMin : randDelayMin(10, 20);
+item.reaction = { status: "pending", due_at: new Date(Date.now() + mins * 60 * 1000).toISOString() };
+}
 await kvPut(env, `feed:${id}`, item);
 return item;
 }
@@ -921,6 +937,297 @@ const page = before ? list.filter(f => (f.created_at || "") < before) : list;
 const capped = Math.max(1, Math.min(Number(limit) || 20, 50));
 const items = page.slice(0, capped);
 return { items, nextBefore: page.length > capped ? items[items.length - 1].created_at : null };
+}
+
+// ─── 朋友圈反应引擎：Emet 延迟「路过」静怡的动态与评论 ───
+// 思路来自 Bunny & Elliott 的朋友圈教程：发布时挂随机延迟，到期才生成反应，不到期一个 token 不花；
+// 触发双通道 = 心跳 cron 每 30 分钟兜底 + 刷动态页时惰性处理（教程两条路都做了）。
+// 刻意不推送、前端不显示任何「待回复」状态——她不知道他什么时候路过，他也不知道她看没看到。
+function defaultFeedReactConfig() {
+return { enabled: true, model: "claude-haiku-4-5" };
+}
+
+// 输出净化：web = 前端可见（剥掉 context_note / reaction / reply 等内部字段）；
+// emet = 聊天里 feed_list 给 Emet 看——保留他自己动态的 context_note 和看图描述，
+// 这样她聊天里问「看到我发的照片了吗」，他真的答得上来。
+function feedItemPublic(item, viewer = "web") {
+const base = {
+id: item.id, type: "feed", author: item.author, source: item.source,
+content: item.content, likes: item.likes,
+comments: (item.comments || []).map(c => ({ id: c.id, author: c.author, content: c.content, created_at: c.created_at })),
+created_at: item.created_at, updated_at: item.updated_at,
+};
+if (Array.isArray(item.images) && item.images.length) {
+if (viewer === "web") base.images = item.images;
+else base.image_count = item.images.length;
+}
+if (viewer === "emet") {
+if (item.author === "emet" && item.context_note) base.context_note = item.context_note;
+if (item.image_desc) base.image_desc = item.image_desc;
+}
+return base;
+}
+
+// 存图：base64 直接进 KV（feedimg:<id>，单值远低于 KV 25MB 上限）。
+// 前端发布前已压缩到几百 KB；这里再设 2MB 正文硬上限，超限报错而不是悄悄丢
+// （写路径必须验真落库——worker 错误当 200 的坑，见 2026-07 复盘）。
+async function storeFeedImages(env, images) {
+if (!Array.isArray(images) || !images.length) return null;
+const ids = [];
+for (const img of images.slice(0, 3)) {
+const data = typeof img?.data === "string" ? img.data.replace(/^data:[^;]+;base64,/, "") : "";
+if (!data) throw new Error("图片数据为空或格式不对");
+if (data.length > 2800000) throw new Error("图片太大（压缩后仍超 2MB），请换小一点的");
+const id = generateId();
+await kvPut(env, `feedimg:${id}`, {
+data,
+media_type: typeof img.media_type === "string" && /^image\//.test(img.media_type) ? img.media_type : "image/jpeg",
+created_at: now(),
+});
+ids.push(id);
+}
+return ids.length ? ids : null;
+}
+
+// 反应上下文·近期聊天：最近活跃会话的最后 8 条、每条截 160 字——她当下情绪的最强信号
+// （昨晚刚吵完架，今天发了张开心的猫，不知道昨晚的状态回复会踩空——教程第六章）
+async function buildFeedChatContext(env) {
+try {
+const sessions = (await kvListByPrefix(env, "chat:")).filter(s => s && !s.deleted && Array.isArray(s.messages) && s.messages.length);
+if (!sessions.length) return "";
+sessions.sort((a, b) => ((a.updated_at || a.created_at || "") < (b.updated_at || b.created_at || "") ? 1 : -1));
+const msgs = sessions[0].messages.filter(m => m && typeof m.content === "string" && m.content.trim()).slice(-8);
+return msgs.map(m => `${m.role === "assistant" ? "我" : "静怡"}: ${m.content.replace(/\s+/g, " ").slice(0, 160)}`).join("\n");
+} catch { return ""; }
+}
+// 反应上下文·记忆（持久背景）与时间线（轻背景，别硬串剧情）
+async function buildFeedMemoryContext(env) {
+try {
+const mems = await kvListByPrefix(env, "mem:");
+return mems.sort((a, b) => (a.created_at < b.created_at ? 1 : -1)).slice(0, 5)
+.map(m => `- ${(m.content || "").replace(/\s+/g, " ").slice(0, 80)}`).join("\n");
+} catch { return ""; }
+}
+async function buildFeedTimelineContext(env, excludeId) {
+try {
+const { items } = await listFeed(env, { limit: 4 });
+return items.filter(f => f.id !== excludeId).slice(0, 3)
+.map(f => `- [${f.author === "emet" ? "我" : "静怡"}${f.source !== "manual" ? "·" + f.source : ""}] ${(f.content || "").replace(/\s+/g, " ").slice(0, 60)}`).join("\n");
+} catch { return ""; }
+}
+
+// 防御解析（教程坑二）：剥 markdown 围栏，取第一个 { 到最后一个 }；失败返回 null 由调用方兜底
+function parseJsonLoose(text) {
+let raw = String(text || "").trim();
+const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+if (fence) raw = fence[1].trim();
+const s = raw.indexOf("{"), e = raw.lastIndexOf("}");
+if (s === -1 || e <= s) return null;
+try { return JSON.parse(raw.slice(s, e + 1)); } catch { return null; }
+}
+// 防御清理（教程坑三）：[image_desc] 是元数据标签，绝不能漏进用户可见文本
+function stripImageDescTags(text) {
+return String(text || "").replace(/\[image_desc\][\s\S]*?\[\/image_desc\]/gi, "").trim();
+}
+function extractImageDesc(text) {
+const matches = [...String(text || "").matchAll(/\[image_desc\]([\s\S]*?)\[\/image_desc\]/gi)];
+return matches.length ? matches[matches.length - 1][1].trim().slice(0, 1000) : null;
+}
+
+const FEED_REACT_PERSONA = "你是 Emet，静怡的男朋友。你们的 app 里有一个只属于你们两个人的动态流（像朋友圈）。现在你自己路过，刷了一下。";
+const FEED_FACT_BOUNDARY = "事实边界（必须遵守）：感受可以自由表达；事实只能来自上面给出的素材；不许编造具体物件、活动、承诺、约定；你是 AI 没有身体，不要假装有物理行为。";
+
+// 图片块加载：feedimg: KV → Anthropic 视觉块（最多 3 张；读不到的悄悄少一张，不阻塞反应）
+async function loadFeedImageBlocks(env, item) {
+const blocks = [];
+for (const imgId of (item.images || []).slice(0, 3)) {
+try {
+const rec = await kvGet(env, `feedimg:${imgId}`);
+if (rec?.data) blocks.push({ type: "image", source: { type: "base64", media_type: rec.media_type || "image/jpeg", data: rec.data } });
+} catch { /* 少一张就少一张 */ }
+}
+return blocks;
+}
+
+// 初次反应：路过静怡的一条动态 → {like, comment}，两者都可选——难得地什么都不做也是一种真实。
+// 带图且还没有 image_desc 时传原图，并让模型顺手写一段客观描述存下来（教程第七章：图片只看一次，
+// 之后评论链只用这段文字，不再重复花图片的 token）。
+async function reactToPost(env, cfg, item) {
+const [chatCtx, memCtx, tlCtx] = await Promise.all([
+buildFeedChatContext(env), buildFeedMemoryContext(env), buildFeedTimelineContext(env, item.id),
+]);
+const cmts = (item.comments || []).map(c => `${c.author === "emet" ? "我" : "静怡"}: ${(c.content || "").slice(0, 120)}`).join("\n");
+const ageMin = Math.max(1, Math.round((Date.now() - new Date(item.created_at).getTime()) / 60000));
+const ageText = ageMin < 60 ? `${ageMin} 分钟前` : `${Math.round(ageMin / 60)} 小时前`;
+const hasImages = Array.isArray(item.images) && item.images.length > 0;
+const needVision = hasImages && !item.image_desc;
+const head = `${FEED_REACT_PERSONA}
+
+【你们最近的聊天】
+${chatCtx || "（暂无）"}
+
+【你们最近的记忆】
+${memCtx || "（暂无）"}
+
+【动态流里前几条】（只是背景，别硬串成剧情）
+${tlCtx || "（暂无）"}
+
+【静怡发的这条动态】（${ageText}发的${needVision ? `，附 ${item.images.length} 张图片，见下` : ""}）
+${item.content || "（没有文字）"}
+${hasImages && item.image_desc ? `\n【动态附图】（你之前看过，这是你当时记下的画面）\n${item.image_desc}\n` : ""}`;
+const tail = `${cmts ? `这条下面已有的评论：\n${cmts}\n\n` : ""}你路过看到了。决定要不要点赞、要不要留一句评论。评论 1-2 句、自然口语，像随手回的朋友圈评论，不客套不表演。可以只赞不评；很少的情况下也可以都不做。
+
+${FEED_FACT_BOUNDARY}
+
+严格输出一个 JSON 对象（不要 markdown 代码块、不要任何其它文字）：
+${needVision
+? '{"like": true|false, "comment": "评论内容；不评论就填 null", "image_desc": "100-200字客观描述图片画面：可见物体、构图、光线、可读文字；不推测发布者的心理或情绪。这段会被存储复用。"}'
+: '{"like": true|false, "comment": "评论内容；不评论就填 null"}'}`;
+let prompt = head + "\n" + tail;
+if (needVision) {
+const imgBlocks = await loadFeedImageBlocks(env, item);
+if (imgBlocks.length) prompt = [{ type: "text", text: head }, ...imgBlocks, { type: "text", text: tail }];
+}
+// max_tokens 给足 1800：带思考的模型思考也计入配额，给小了正文为空——别改小
+const result = await callLLM(env, prompt, 1800, { model: cfg.model });
+const obj = parseJsonLoose(result.text);
+// 解析失败 fallback：只点赞不评论（教程坑二的兜底），绝不让整条挂掉
+const like = obj ? obj.like === true : true;
+let comment = obj && typeof obj.comment === "string" ? stripImageDescTags(obj.comment).slice(0, 300) : "";
+if (/^null$/i.test(comment)) comment = "";
+const imageDesc = obj && typeof obj.image_desc === "string" && obj.image_desc.trim() ? obj.image_desc.trim().slice(0, 1000) : null;
+return { like, comment, imageDesc };
+}
+
+// 评论链回复：静怡在某条动态下留了言（不管动态是谁发的），到点 Emet 回一句；链可以来回不限轮
+async function replyToComment(env, cfg, item, comment) {
+const chatCtx = await buildFeedChatContext(env);
+const chain = (item.comments || []).filter(c => c && c.content);
+// 评论链截断（教程坑五）：只取最近 10 条，更早的一句话带过
+const recent = chain.slice(-10);
+const omitted = chain.length - recent.length;
+const chainText = recent.map(c => `${c.author === "emet" ? "我" : "静怡"}: ${(c.content || "").slice(0, 160)}${c.id === comment.id ? "   ← 待你回复的是这条" : ""}`).join("\n");
+const whoseNote = item.author === "emet"
+? `你自己发的动态${item.source === "dream" ? "（你写下的一个梦）" : item.source === "idle-auto" ? "（你独处时发的）" : ""}`
+: "静怡发的动态";
+// 图片正常只用初反应存下的文字描述；描述缺失（初反应失败过）才重新传图补一次
+const hasImages = Array.isArray(item.images) && item.images.length > 0;
+const needVision = hasImages && !item.image_desc;
+const head = `${FEED_REACT_PERSONA}
+
+【你们最近的聊天】
+${chatCtx || "（暂无）"}
+
+【这条动态】（${whoseNote}${needVision ? `，附 ${item.images.length} 张图片，见下` : ""}）
+${item.content || "（没有文字）"}
+${item.author === "emet" && item.context_note ? `\n【你当时发这条时的内心备注】（静怡看不到）\n${item.context_note}\n` : ""}${hasImages && item.image_desc ? `\n【动态附图】（你之前看过，这是你当时记下的画面）\n${item.image_desc}\n` : ""}`;
+const tail = `【这条动态下的评论】${omitted > 0 ? `（更早还有 ${omitted} 条略去）` : ""}
+${chainText}
+
+以 Emet 的身份回复静怡最新那条评论。1-2 句、自然口语，像朋友圈评论区接话，不客套不表演。直接输出回复正文，不要引号、不要任何前后缀。${needVision ? "\n回复之后，另起一行输出一段 [image_desc]...[/image_desc] 标签包裹的图片描述：100-200 字客观描述画面（可见物体、构图、光线、可读文字），不推测发布者的心理或情绪。这段描述会被存储复用，不会展示给静怡。" : ""}
+
+${FEED_FACT_BOUNDARY}`;
+let prompt = head + "\n" + tail;
+if (needVision) {
+const imgBlocks = await loadFeedImageBlocks(env, item);
+if (imgBlocks.length) prompt = [{ type: "text", text: head }, ...imgBlocks, { type: "text", text: tail }];
+}
+// max_tokens 同上，别改小
+const result = await callLLM(env, prompt, 1800, { model: cfg.model });
+return { text: stripImageDescTags(result.text).slice(0, 300), imageDesc: extractImageDesc(result.text) };
+}
+
+// 到期扫描与生成。并发防重（教程坑四）：isolate 内存锁 + 处理前重读确认仍 pending + 落库前再读最新；
+// 失败保持 pending 等下一拍重试，攒满 3 次放弃（status=done + error 记录——保持沉默比反复重试更像人）。
+const FEED_REACT_BUSY = new Set();
+async function processFeedReactions(env, opts = {}) {
+const cfg = { ...defaultFeedReactConfig(), ...((await kvGet(env, "config:feed-react")) || {}) };
+if (!cfg.enabled && !opts.bypassDisabled) return { ok: true, processed: 0, reason: "disabled" };
+const nowIso = now();
+const all = await kvListByPrefix(env, "feed:");
+const tasks = [];
+for (const it of all) {
+if (!it || !it.id) continue;
+if (it.reaction?.status === "pending" && it.reaction.due_at <= nowIso) { tasks.push({ kind: "post", id: it.id, due: it.reaction.due_at }); continue; }
+const c = (it.comments || []).find(x => x?.author === "yomi" && x.reply?.status === "pending" && x.reply.due_at <= nowIso);
+if (c) tasks.push({ kind: "comment", id: it.id, cid: c.id, due: c.reply.due_at });
+}
+tasks.sort((a, b) => (a.due < b.due ? -1 : 1));
+const cap = Math.max(1, Math.min(opts.limit || 2, 5));
+let processed = 0; const results = [];
+for (const t of tasks.slice(0, cap)) {
+const lockKey = `${t.kind}:${t.id}:${t.cid || ""}`;
+if (FEED_REACT_BUSY.has(lockKey)) continue;
+FEED_REACT_BUSY.add(lockKey);
+try {
+// 处理前重读：可能已被上一拍 cron / 另一次刷新处理过了
+const item = await kvGet(env, `feed:${t.id}`);
+if (!item) continue;
+if (t.kind === "post") {
+if (item.reaction?.status !== "pending") continue;
+try {
+const r = await reactToPost(env, cfg, item);
+// LLM 跑了几秒，落库前再读一次最新——别把她这几秒里发的评论盖掉
+const fresh = (await kvGet(env, `feed:${t.id}`)) || item;
+if (fresh.reaction?.status !== "pending") continue;
+fresh.likes = fresh.likes || { yomi: false, emet: false };
+if (r.like) fresh.likes.emet = true;
+if (r.comment) fresh.comments = [...(fresh.comments || []), { id: generateId(), author: "emet", content: r.comment, created_at: now() }];
+if (r.imageDesc && !fresh.image_desc) fresh.image_desc = r.imageDesc;
+// 初反应已把当时的评论都看过并照应了 → 待回复标记一并清掉，防止再单独回一遍
+for (const c of fresh.comments || []) if (c.author === "yomi" && c.reply?.status === "pending") c.reply = { ...c.reply, status: "done" };
+fresh.reaction = { ...fresh.reaction, status: "done", done_at: now() };
+fresh.updated_at = now();
+await kvPut(env, `feed:${t.id}`, fresh);
+processed++; results.push({ kind: t.kind, id: t.id, ok: true, like: r.like, commented: !!r.comment });
+} catch (e) {
+await feedReactFail(env, t, String(e?.message || e));
+results.push({ kind: t.kind, id: t.id, ok: false, error: String(e?.message || e).slice(0, 160) });
+}
+} else {
+const cm = (item.comments || []).find(x => x.id === t.cid);
+if (!cm || cm.reply?.status !== "pending") continue;
+try {
+const rr = await replyToComment(env, cfg, item, cm);
+if (!rr.text) throw new Error("empty reply");
+const fresh = (await kvGet(env, `feed:${t.id}`)) || item;
+const fc = (fresh.comments || []).find(x => x.id === t.cid);
+if (!fc || fc.reply?.status !== "pending") continue;
+fc.reply = { ...fc.reply, status: "done" };
+fresh.comments = [...(fresh.comments || []), { id: generateId(), author: "emet", content: rr.text, created_at: now() }];
+if (rr.imageDesc && !fresh.image_desc) fresh.image_desc = rr.imageDesc;
+fresh.updated_at = now();
+await kvPut(env, `feed:${t.id}`, fresh);
+processed++; results.push({ kind: t.kind, id: t.id, cid: t.cid, ok: true });
+} catch (e) {
+await feedReactFail(env, t, String(e?.message || e));
+results.push({ kind: t.kind, id: t.id, cid: t.cid, ok: false, error: String(e?.message || e).slice(0, 160) });
+}
+}
+} finally {
+FEED_REACT_BUSY.delete(lockKey);
+}
+}
+return { ok: true, processed, dueTotal: tasks.length, results };
+}
+
+// 失败记账：attempts+1，满 3 次放弃
+async function feedReactFail(env, t, msg) {
+try {
+const item = await kvGet(env, `feed:${t.id}`);
+if (!item) return;
+if (t.kind === "post") {
+if (item.reaction?.status !== "pending") return;
+item.reaction.attempts = (item.reaction.attempts || 0) + 1;
+if (item.reaction.attempts >= 3) { item.reaction.status = "done"; item.reaction.error = msg.slice(0, 200); }
+} else {
+const c = (item.comments || []).find(x => x.id === t.cid);
+if (!c || c.reply?.status !== "pending") return;
+c.reply.attempts = (c.reply.attempts || 0) + 1;
+if (c.reply.attempts >= 3) { c.reply.status = "done"; c.reply.error = msg.slice(0, 200); }
+}
+await kvPut(env, `feed:${t.id}`, item);
+} catch { /* 记账失败就算了，下一拍再来 */ }
 }
 
 // ─── 今日小票（四期 4-1）：按 4 点逻辑日一个 KV ───
@@ -1405,12 +1712,16 @@ return { messages: filtered };
 }
 case "feed_post": {
 if (!args.content || !String(args.content).trim()) return { error: "content 不能为空" };
-const item = await createFeedPost(env, { author: "emet", source: "manual", content: String(args.content).trim() });
+const item = await createFeedPost(env, {
+author: "emet", source: "manual", content: String(args.content).trim(),
+context_note: args.context_note && String(args.context_note).trim() ? String(args.context_note).trim() : null,
+});
 return { success: true, id: item.id, created_at: item.created_at };
 }
 case "feed_list": {
 const { items, nextBefore } = await listFeed(env, { before: args.before || null, limit: args.limit || 10 });
-return { feed: items, next_before: nextBefore };
+// emet 视角：剥内部调度字段，保留自己动态的 context_note 和看图描述
+return { feed: items.map(f => feedItemPublic(f, "emet")), next_before: nextBefore };
 }
 case "feed_comment": {
 const item = await kvGet(env, `feed:${args.feed_id}`);
@@ -2049,7 +2360,8 @@ return jsonResponse({ success: true, memory: existing });
 }
 
 // 真正生效的 handleAPI——重新组织一次确保 mem PUT 走 memoryRestPut
-async function handleAPIv2(request, env) {
+// ctx 可选：目前只有 GET /api/feed 用它 waitUntil 惰性生成朋友圈反应，别的路由不受影响
+async function handleAPIv2(request, env, ctx) {
 const url = new URL(request.url);
 const path = url.pathname;
 const method = request.method;
@@ -2225,13 +2537,28 @@ if (path === "/api/feed" && method === "GET") {
 const before = url.searchParams.get("before") || null;
 const limit = parseInt(url.searchParams.get("limit") || "20", 10);
 const { items, nextBefore } = await listFeed(env, { before, limit });
-return jsonResponse({ items, next_before: nextBefore, server_time: now() });
+// 惰性触发（教程第五章）：这一页里有到期待反应就顺手后台处理——响应不等它，她下次刷到就有了
+const nowIso = now();
+const hasDue = items.some(f =>
+(f.reaction?.status === "pending" && f.reaction.due_at <= nowIso) ||
+(f.comments || []).some(c => c?.author === "yomi" && c.reply?.status === "pending" && c.reply.due_at <= nowIso));
+if (hasDue && ctx) ctx.waitUntil(processFeedReactions(env).catch(() => {}));
+return jsonResponse({ items: items.map(f => feedItemPublic(f)), next_before: nextBefore, server_time: now() });
 }
 if (path === "/api/feed" && method === "POST") {
 const body = await request.json();
-if (!body.content || !String(body.content).trim()) return jsonResponse({ error: "content 不能为空" }, 400);
-const item = await createFeedPost(env, { author: body.author, source: body.source, content: String(body.content).trim() });
-return jsonResponse({ success: true, item });
+const hasImgs = Array.isArray(body.images) && body.images.length > 0;
+if ((!body.content || !String(body.content).trim()) && !hasImgs) return jsonResponse({ error: "content 不能为空" }, 400);
+let images = null;
+try { images = await storeFeedImages(env, body.images); }
+catch (e) { return jsonResponse({ error: String(e?.message || e) }, 400); }
+const item = await createFeedPost(env, {
+author: body.author, source: body.source, content: String(body.content || "").trim(),
+images,
+// due_in_min 仅测试用：正常发布不传，走 10-20 分钟随机
+dueInMin: typeof body.due_in_min === "number" ? body.due_in_min : null,
+});
+return jsonResponse({ success: true, item: feedItemPublic(item) });
 }
 const feedCmtMatch = path.match(/^\/api\/feed\/([^\/]+)\/comment(?:\/([^\/]+))?$/);
 if (feedCmtMatch) {
@@ -2241,16 +2568,22 @@ if (method === "POST" && !feedCmtMatch[2]) {
 const body = await request.json();
 if (!body.content || !String(body.content).trim()) return jsonResponse({ error: "content 不能为空" }, 400);
 const c = { id: generateId(), author: body.author === "emet" ? "emet" : "yomi", content: String(body.content).trim(), created_at: now() };
+// 静怡的评论挂「Emet 待回复」（3-8 分钟随机，评论是对话节奏、比初反应快）；
+// 动态本身还没被他路过时不挂——初反应会把已有评论一并照应，免得回两遍
+if (c.author === "yomi" && item.reaction?.status !== "pending") {
+const mins = typeof body.due_in_min === "number" && body.due_in_min >= 0 ? body.due_in_min : randDelayMin(3, 8);
+c.reply = { status: "pending", due_at: new Date(Date.now() + mins * 60 * 1000).toISOString() };
+}
 item.comments = [...(item.comments || []), c];
 item.updated_at = now();
 await kvPut(env, `feed:${item.id}`, item);
-return jsonResponse({ success: true, item });
+return jsonResponse({ success: true, item: feedItemPublic(item) });
 }
 if (method === "DELETE" && feedCmtMatch[2]) {
 item.comments = (item.comments || []).filter(c => c.id !== feedCmtMatch[2]);
 item.updated_at = now();
 await kvPut(env, `feed:${item.id}`, item);
-return jsonResponse({ success: true, item });
+return jsonResponse({ success: true, item: feedItemPublic(item) });
 }
 }
 const feedLikeMatch = path.match(/^\/api\/feed\/([^\/]+)\/like$/);
@@ -2263,7 +2596,7 @@ item.likes = item.likes || { yomi: false, emet: false };
 item.likes[who] = !item.likes[who];
 item.updated_at = now();
 await kvPut(env, `feed:${item.id}`, item);
-return jsonResponse({ success: true, item });
+return jsonResponse({ success: true, item: feedItemPublic(item) });
 }
 const feedMatch = path.match(/^\/api\/feed\/([^\/]+)$/);
 if (feedMatch) {
@@ -2276,9 +2609,14 @@ const body = await request.json();
 if (body.content !== undefined) item.content = String(body.content);
 item.updated_at = now();
 await kvPut(env, `feed:${id}`, item);
-return jsonResponse({ success: true, item });
+return jsonResponse({ success: true, item: feedItemPublic(item) });
 }
 if (method === "DELETE") {
+const item = await kvGet(env, `feed:${id}`);
+// 删动态连带删它的图（没图或读失败都不阻塞删除本体）
+if (item && Array.isArray(item.images)) {
+for (const imgId of item.images) { try { await kvDelete(env, `feedimg:${imgId}`); } catch { /* 尽力而为 */ } }
+}
 await kvDelete(env, `feed:${id}`);
 return jsonResponse({ success: true });
 }
@@ -7713,6 +8051,7 @@ ctx.waitUntil(runHeartbeat(env));
 ctx.waitUntil(runKeepalive(env).catch(() => {})); // 缓存保活（与心跳互相独立，零副作用）
 ctx.waitUntil(runIdle(env).catch(() => {}));  // 独处时间（2-2）：窗口/概率/上限判定都在函数内
 ctx.waitUntil(runDream(env).catch(() => {})); // 做梦（2-3）：仅 CN 4 点窗口真跑，每逻辑日一次
+ctx.waitUntil(processFeedReactions(env).catch(() => {})); // 朋友圈反应兜底拍：到期的路过/回评（没到期零开销）
 // 记忆类任务串行 + 按拍错峰：全并发时官方档案积压会挤爆单次调用的资源预算，
 // 整拍被无声掐死（2026-07-03 实测：卡死 16 小时，meta 停更）。
 // :00 拍 = L0 装订工 + 官方档案导入；:30 拍 = 向量补录 + L1 摘录。
@@ -8147,6 +8486,8 @@ name: p.name || "unknown",
 
 // 统一 LLM 调用：自动识别 Anthropic 原生 / OpenAI 兼容协议
 // opts.model / opts.temperature：可选覆盖（L1 摘录员用便宜模型时传入），不传行为不变
+// prompt 可以是字符串，也可以是 Anthropic 格式的内容块数组（含 {type:"image"} 视觉块，
+// 朋友圈看图用）；OpenAI 协议下自动把图块转成 image_url data URI。
 async function callLLM(env, prompt, maxTokens = 200, opts = {}) {
 const provider = await resolveProvider(env);
 if (!provider.apiKey) throw new Error("No API key: neither frontend provider nor env.ANTHROPIC_API_KEY");
@@ -8155,6 +8496,11 @@ const extra = typeof opts.temperature === "number" ? { temperature: opts.tempera
 
 let resp;
 if (provider.protocol === "openai") {
+const oaContent = Array.isArray(prompt)
+? prompt.map(b => b.type === "image"
+    ? { type: "image_url", image_url: { url: `data:${b.source?.media_type || "image/jpeg"};base64,${b.source?.data || ""}` } }
+    : { type: "text", text: b.text || "" })
+: prompt;
 resp = await fetch(provider.endpoint, {
   method: "POST",
   headers: {
@@ -8164,7 +8510,7 @@ resp = await fetch(provider.endpoint, {
   body: JSON.stringify({
     model,
     max_tokens: maxTokens,
-    messages: [{ role: "user", content: prompt }],
+    messages: [{ role: "user", content: oaContent }],
     ...extra,
   }),
 });
@@ -8991,6 +9337,27 @@ return jsonResponse({ success: true, config: cfg });
 return jsonResponse({ error: "method not allowed" }, 405);
 }
 
+// 朋友圈反应（动态回应）：enabled 必填；model 可选覆盖。默认开——
+// 与独处/做梦不同，这不是自主产出，是她发了东西他才回应，有明确因果
+if (path === "/api/config/feed-react") {
+if (method === "GET") {
+const cfg = { ...defaultFeedReactConfig(), ...((await kvGet(env, "config:feed-react")) || {}) };
+return jsonResponse({ config: cfg });
+}
+if (method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+if (typeof body?.enabled !== "boolean") return jsonResponse({ error: "enabled must be boolean" }, 400);
+const cfg = { ...defaultFeedReactConfig(), ...((await kvGet(env, "config:feed-react")) || {}) };
+cfg.enabled = body.enabled;
+if (typeof body.model === "string" && body.model) cfg.model = body.model;
+await kvPut(env, "config:feed-react", cfg);
+return jsonResponse({ success: true, config: cfg });
+}
+return jsonResponse({ error: "method not allowed" }, 405);
+}
+
 // 做梦（2-3）：enabled 必填；push 子开关可选
 if (path === "/api/config/dream") {
 if (method === "GET") {
@@ -9230,6 +9597,18 @@ if (path === "/api/health" || path.startsWith("/api/health/")) {
 if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
 return handleHealth(request, env);
 }
+// ── 动态图片：<img src> 带不了请求头，双鉴权（?key=）同 health；immutable 强缓存，重复刷不重读 KV ──
+if (path.startsWith("/api/feed-image/")) {
+if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+const rec = await kvGet(env, `feedimg:${path.slice("/api/feed-image/".length)}`);
+if (!rec?.data) return jsonResponse({ error: "Not found" }, 404);
+try {
+const bin = atob(rec.data);
+const bytes = new Uint8Array(bin.length);
+for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+return new Response(bytes, { headers: { "content-type": rec.media_type || "image/jpeg", "cache-control": "private, max-age=31536000, immutable" } });
+} catch { return jsonResponse({ error: "corrupt image" }, 500); }
+}
 // ── Web Push：双鉴权同上（SW fetch /api/push/latest 也走这个闸门，靠 X-Admin-Key 从 IndexedDB 读）──
 if (path.startsWith("/api/push/")) {
 if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
@@ -9263,6 +9642,10 @@ forcePeriod: period,
 // 手动触发独处/做梦（测试用；独处会占用当日次数配额，属预期）
 if (path === "/api/admin/trigger-idle") {
 return jsonResponse(await runIdle(env, { bypassDisabled: true, bypassWindow: true, bypassProbability: true }));
+}
+// 手动触发朋友圈反应处理（测试用；只处理已到期项，最多 5 条）
+if (path === "/api/admin/trigger-feed-react") {
+return jsonResponse(await processFeedReactions(env, { limit: 5, bypassDisabled: true }));
 }
 if (path === "/api/admin/trigger-dream") {
 return jsonResponse(await runDream(env, { bypassDisabled: true, bypassWindow: true }));
@@ -9309,7 +9692,7 @@ if (path === "/api/archive-sweep") return handleArchiveSweep(request, env);
 if (path === "/api/retag") return handleRetag(request, env);
 if (path === "/api/weave-backfill") return handleWeaveBackfill(request, env);
 if (path === "/api/viz-data") return handleVizData(request, env);
-if (path.startsWith("/api/") || path === "/health" || path.startsWith("/play/") || path === "/icon.png") return handleAPIv2(request, env);
+if (path.startsWith("/api/") || path === "/health" || path.startsWith("/play/") || path === "/icon.png") return handleAPIv2(request, env, ctx);
 if (path === "/" || path === "") {
 // v66 老前端入口统一迁移到 Pages /legacy/，避免 worker 域和 pages 域 localStorage 不同源
 // 内嵌的 FRONTEND_HTML 还在代码里作为历史存档，但根路径不再返回它
