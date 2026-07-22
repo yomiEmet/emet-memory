@@ -6646,7 +6646,10 @@ const ALLOWED_ORIGINS = [
 // 只放行 RFC1918 私有网段 + 8000 端口：公网域名/IP 不可能匹配上这个形状，
 // 且所有 /api/* 照旧要求 X-Admin-Key，放行 CORS 不放行数据，安全面不变。
 const LAN_BRIDGE_ORIGIN_RE = /^http:\/\/(?:192\.168\.\d{1,3}\.\d{1,3}|10\.(?:\d{1,3}\.){2}\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}):8000$/;
-const isAllowedOrigin = (origin) => ALLOWED_ORIGINS.includes(origin) || LAN_BRIDGE_ORIGIN_RE.test(origin);
+// localhost 任意端口一并放行：多会话并行开发时 vite 会落在 5174+（PORT 覆盖），
+// 与上面 LAN 网段同理——放行 CORS 不放行数据，/api/* 照旧要求 X-Admin-Key，安全面不变。
+const LOCALHOST_ORIGIN_RE = /^http:\/\/localhost:\d+$/;
+const isAllowedOrigin = (origin) => ALLOWED_ORIGINS.includes(origin) || LAN_BRIDGE_ORIGIN_RE.test(origin) || LOCALHOST_ORIGIN_RE.test(origin);
 
 // ── /mcp、/sse 的 CORS ──
 // 对所有来源放行 *（浏览器非凭证请求 + claude.ai 连接器都需要）；
