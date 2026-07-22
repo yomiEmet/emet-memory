@@ -8476,15 +8476,25 @@ if (!p) p = enabled[0];
 // 只有浏览器/手机中转够得着。聊天目标选了它时，后台任务（心跳/独处/做梦/朋友圈反应/摘要）
 // 自动退回下一个公网可达的 enabled provider，否则这些任务会全部静默挂掉（2026-07-22 实测）。
 const isLocalUrl = (u) => /^https?:\/\/(localhost|127\.|0\.0\.0\.0|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(String(u || ""));
+let swappedFromLocal = false;
 if (isLocalUrl(p.baseUrl)) {
 const pub = enabled.find(x => !isLocalUrl(x.baseUrl));
 if (!pub) throw new Error("no reachable provider: 只启用了本机供应商，云端后台任务够不着它");
 p = pub;
+swappedFromLocal = true;
 }
 const targetModel = (p.id === settings.chatTarget?.providerId && settings.chatTarget?.model) ? settings.chatTarget.model : null;
+// 从本机回退时，模型尽量贴近她给聊天选的那个（回退方也有同名就用它，成本档位与切本机前一致）；
+// 都没有就挑第一个非 -think 模型——think 系的思考计入 max_tokens，心跳这类小配额（300）调用会拿到空正文
+const fallbackModel = swappedFromLocal
+? ((settings.chatTarget?.model && p.models?.includes(settings.chatTarget.model))
+? settings.chatTarget.model
+: (p.models || []).find(m => !/-think$/i.test(m)) || null)
+: null;
 const model = targetModel && p.models?.includes(targetModel)
 ? targetModel
-: (p.defaultModel && p.models?.includes(p.defaultModel) ? p.defaultModel : (p.models?.[0] || "claude-haiku-4-5-20251001"));
+: (fallbackModel
+|| (p.defaultModel && p.models?.includes(p.defaultModel) ? p.defaultModel : (p.models?.[0] || "claude-haiku-4-5-20251001")));
 let base = (p.baseUrl || "").replace(/\/+$/, "");
 if (!/\/v1$/.test(base)) base += "/v1";
 return {
