@@ -679,7 +679,7 @@ inputSchema: { type: "object", properties: {
 start: { type: "string" },
 end: { type: "string" }
 } } },
-{ name: "life_daily", description: "查静怡某天的生活打卡：喝水（0-7 杯）和运动（分钟），她在主页记录。date 默认今天（凌晨4点切天）。",
+{ name: "life_daily", description: "查静怡某天的生活打卡：喝水（water 杯数 / water_ml 总毫升 / water_entries 每条带时间·毫升·饮品类别如水茶咖啡）和运动分钟数。date 默认今天（凌晨4点切天）。",
 inputSchema: { type: "object", properties: {
 date: { type: "string", description: "可选，YYYY-MM-DD" }
 } } },
@@ -979,7 +979,7 @@ const data = typeof img?.data === "string" ? img.data.replace(/^data:[^;]+;base6
 if (!data) throw new Error("图片数据为空或格式不对");
 if (data.length > 2800000) throw new Error("图片太大（压缩后仍超 2MB），请换小一点的");
 const id = generateId();
-await kvPut(env, `feedimg:${id}`, {
+await kvPut(env, `${prefix}:${id}`, {
 data,
 media_type: typeof img.media_type === "string" && /^image\//.test(img.media_type) ? img.media_type : "image/jpeg",
 created_at: now(),
@@ -1481,12 +1481,14 @@ const rs = await mem2RawSearch(env, query, 6);
 if (!rs.length) return { __raw_text: "原文检索无结果。提示：逐字匹配整个短语、至少3个字；可换更短的词组，或去掉exact用语义检索。" };
 return { __raw_text: rs.map(r => `[${r.date} ${r.source} ${r.role}] ${r.content}`).join("\n---\n") };
 }
-const [vault, archive] = await Promise.all([
+const [vault, archive, momHits] = await Promise.all([
 args.conv_id ? Promise.resolve([]) : mem2SearchL1(env, query, 4, true), // recall 命中才计 access
 mem2ArchiveSearch(env, { query, n: 4, after: args.after, before: args.before, conv_id: args.conv_id }),
+args.conv_id ? Promise.resolve([]) : momentVecSearch(env, query, 3), // 瞬记道（2026-07-22 补齐）
 ]);
 const parts = [];
 if (vault.length) parts.push(vault.map(v => `[${v.date} ${v.category}] ${v.document}`).join("\n---\n"));
+if (momHits.length) parts.push("——瞬记——\n" + momHits.map(h => `[${h.date} 瞬记] ${h.content}`).join("\n---\n"));
 if (archive.length) parts.push("——聊天原文存档——\n" + archive.map(a => `${a.document}\n(conv_id=${a.metadata.conv_id})`).join("\n---\n"));
 if (!parts.length) return { __raw_text: "没有找到相关记忆" + ((args.after || args.before) ? "（试试放宽日期范围）" : "") };
 return { __raw_text: parts.join("\n\n") };
@@ -1605,6 +1607,7 @@ locked: false,
 created_at: createdAt
 };
 await kvPut(env, `mom:${id}`, moment);
+try { await momentVecUpsert(env, moment); } catch (e) { /* 向量失败不挡保存，sweep 兜底 */ }
 return { success: true, id, message: `瞬记: ${args.content.substring(0, 40)}${args.content.length > 40 ? "..." : ""}` };
 }
 case "moment_list": {
@@ -1630,9 +1633,9 @@ try {
   }
   recent_emotions.sort((a, b) => (a.ts < b.ts ? 1 : -1));
   recent_emotions = recent_emotions.slice(0, 5).map(e => ({ ts: e.ts, level: e.level, note: e.note }));
-  const water = await kvGet(env, `water:${k0}`);
+  const w = await waterDay(env, k0);
   const exercise = await kvGet(env, `exercise:${k0}`);
-  life = { date: k0, water: water?.count || 0, exercise_minutes: exercise?.minutes || 0 };
+  life = { date: k0, water: w.count, water_ml: w.total_ml, exercise_minutes: exercise?.minutes || 0 };
 } catch { /* 附带信息取不到不影响主体 */ }
 if (all.length === 0) return { status: null, message: "还没有瞬记", recent_emotions, life };
 all.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
@@ -1868,9 +1871,15 @@ case "life_daily": {
 const date = (typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date))
   ? args.date
   : logicalToday();
-const water = await kvGet(env, `water:${date}`);
+const w = await waterDay(env, date);
 const exercise = await kvGet(env, `exercise:${date}`);
-return { date, water: water?.count || 0, exercise_minutes: exercise?.minutes || 0 };
+return {
+  date,
+  water: w.count,
+  water_ml: w.total_ml,
+  water_entries: w.entries.map(e => ({ ts: e.ts, ml: e.ml, kind: e.kind })),
+  exercise_minutes: exercise?.minutes || 0,
+};
 }
 case "handoff_save": {
 const id = generateId();
@@ -2812,22 +2821,56 @@ return jsonResponse(await executeTool("mood_set", body, env));
 }
 }
 
-// 喝水/运动：轻量日计数，直接 KV 存取（不走 MCP tool）
-// GET /api/water?date=YYYY-MM-DD  → { date, count }
-// POST /api/water { date, count } → { success, date, count }
+// 喝水：升级为明细记录（每条 ml+饮品类别+时间），旧 {count} 数据读时兼容。
+// GET  /api/water?date       → { date, count, total_ml, entries:[{id,ts,ml,kind}] }
+// POST /api/water/entry      → { date?, ml, kind } 追加一条（date 默认逻辑日今天）
+// DELETE /api/water/entry?date=&id=
+// POST /api/water {date,count} 旧口径仍收（老前端兼容），只更新 count 不动 entries
 if (path === "/api/water") {
 if (method === "GET") {
 const date = url.searchParams.get("date");
 if (!date) return jsonResponse({ error: "date required" }, 400);
-const val = await kvGet(env, `water:${date}`);
-return jsonResponse(val || { date, count: 0 });
+return jsonResponse(await waterDay(env, date));
 }
 if (method === "POST") {
 const body = await request.json();
 if (!body.date) return jsonResponse({ error: "date required" }, 400);
-const rec = { date: body.date, count: Number(body.count) || 0, updated_at: now() };
+const rec = (await kvGet(env, `water:${body.date}`)) || {};
+rec.date = body.date;
+rec.count = Number(body.count) || 0;
+rec.updated_at = now();
 await kvPut(env, `water:${body.date}`, rec);
-return jsonResponse({ success: true, ...rec });
+return jsonResponse({ success: true, ...(await waterDay(env, body.date)) });
+}
+}
+if (path === "/api/water/entry") {
+if (method === "POST") {
+const body = await request.json();
+const ml = Number(body.ml);
+if (!(Number.isFinite(ml) && ml > 0 && ml <= 3000)) return jsonResponse({ error: "ml 必须 1-3000" }, 400);
+const date = (typeof body.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.date)) ? body.date : logicalToday();
+const rec = (await kvGet(env, `water:${date}`)) || {};
+if (!Array.isArray(rec.entries)) rec.entries = [];
+const entry = { id: generateId(), ts: now(), ml: Math.round(ml), kind: String(body.kind || "水").slice(0, 12) };
+rec.entries.push(entry);
+rec.date = date;
+rec.count = rec.entries.length; // 明细时代 count=条数，老字段跟着走
+rec.updated_at = now();
+await kvPut(env, `water:${date}`, rec);
+return jsonResponse({ success: true, entry, ...(await waterDay(env, date)) });
+}
+if (method === "DELETE") {
+const date = url.searchParams.get("date");
+const id = url.searchParams.get("id");
+if (!date || !id) return jsonResponse({ error: "date/id required" }, 400);
+const rec = await kvGet(env, `water:${date}`);
+if (rec && Array.isArray(rec.entries)) {
+rec.entries = rec.entries.filter(e => e.id !== id);
+rec.count = rec.entries.length;
+rec.updated_at = now();
+await kvPut(env, `water:${date}`, rec);
+}
+return jsonResponse({ success: true, ...(await waterDay(env, date)) });
 }
 }
 // GET /api/exercise?date=YYYY-MM-DD  → { date, minutes }
@@ -7913,10 +7956,97 @@ async function runExtraction(env, opts = {}) {
 }
 
 // /api/mem2/* 子路由（鉴权在 routeRequest 统一做，checkMcpAuth 级别）
+// ════════════════════════════════════════════════════════════
+// 瞬记向量层（2026-07-22）：layer=moment
+// 背景：recall 三通道（记忆/摘录/存档）从未覆盖瞬记，前端瞬记搜索只有本地
+// 关键词过滤，换个说法就搜不到。本层把瞬记编进 Vectorize（bge-m3 同索引），
+// 内容直接放 metadata（瞬记短，绕开 D1 联查；上限裁 2000 字符）。
+// 同步链路：moment_save 落库时即时向量化；编辑(PUT)/删除/漏网旧数据统一由
+// momentVecSweep 收敛（内容哈希比对：变了重嵌，没了清幽灵；:30 cron 拍搭车）。
+// ════════════════════════════════════════════════════════════
+const momHash = (s) => { let h = 5381; const t = String(s || ""); for (let i = 0; i < t.length; i++) h = ((h << 5) + h + t.charCodeAt(i)) | 0; return String(h); };
+const momDateInt = (iso) => parseInt(String(iso || "").slice(0, 10).replace(/-/g, ""), 10) || 0;
+const momVecText = (m) => [m.content || "", (m.tags || []).join(" ")].filter(Boolean).join("\n");
+const momVecPoint = (m, vec) => ({
+  id: "mom:" + m.id, values: vec,
+  metadata: {
+    layer: "moment", date_int: momDateInt(m.created_at), date: (m.created_at || "").slice(0, 10),
+    content: (m.content || "").slice(0, 2000), tags: (m.tags || []).join(","),
+  },
+});
+
+async function momentVecUpsert(env, m) {
+  const vec = await embedText(env, momVecText(m));
+  if (!vec) return false;
+  await env.VEC.upsert([momVecPoint(m, vec)]);
+  await kvPut(env, "momvec:" + m.id, { id: m.id, h: momHash(momVecText(m)) });
+  return true;
+}
+
+async function momentVecSweep(env, cap = 80) {
+  const moms = await kvListByPrefix(env, "mom:");
+  const marks = await kvListByPrefix(env, "momvec:");
+  const markById = new Map(marks.map((x) => [x.id, x.h]));
+  const momById = new Map(moms.map((m) => [m.id, m]));
+  let purged = 0;
+  // 幽灵清理：标记还在、瞬记已删 → 删向量 + 标记
+  for (const [id] of markById) {
+    if (momById.has(id)) continue;
+    try { await env.VEC.deleteByIds(["mom:" + id]); } catch (e) {}
+    await kvDelete(env, "momvec:" + id);
+    if (++purged >= cap) break;
+  }
+  // 缺的 / 内容变了 → 批量嵌入 + 覆盖
+  const todo = [];
+  for (const m of moms) {
+    if (markById.get(m.id) !== momHash(momVecText(m))) todo.push(m);
+    if (todo.length >= cap) break;
+  }
+  let upserted = 0;
+  for (let i = 0; i < todo.length; i += 20) {
+    const batch = todo.slice(i, i + 20);
+    const vecs = await mem2EmbedBatch(env, batch.map(momVecText));
+    const pts = batch.map((m, j) => momVecPoint(m, vecs[j])).filter((p) => Array.isArray(p.values));
+    if (pts.length) await env.VEC.upsert(pts);
+    for (const m of batch) await kvPut(env, "momvec:" + m.id, { id: m.id, h: momHash(momVecText(m)) });
+    upserted += pts.length;
+  }
+  return { total: moms.length, upserted, purged, pending: Math.max(0, moms.length - marks.length - upserted) };
+}
+
+async function momentVecSearch(env, query, n = 10) {
+  if (!String(query || "").trim()) return [];
+  const qv = await embedText(env, query);
+  if (!qv) return [];
+  let res;
+  try {
+    res = await env.VEC.query(qv, { topK: Math.min(n * 2, 30), filter: { layer: "moment" }, returnMetadata: "all" });
+  } catch (e) { return []; }
+  const out = [];
+  for (const m of res?.matches || []) {
+    const dist = 1 - (m.score || 0);
+    if (dist > MEM2_HARD_DIST) continue; // UI 检索取宽松线 0.50，宁多勿漏
+    const md = m.metadata || {};
+    out.push({
+      id: String(m.id).replace(/^mom:/, ""), content: md.content || "", date: md.date || "",
+      tags: md.tags ? String(md.tags).split(",").filter(Boolean) : [], distance: Math.round(dist * 1000) / 1000,
+    });
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
 async function handleMem2(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+  if (path === "/api/mem2/moment-search" && method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    return jsonResponse({ results: await momentVecSearch(env, body.query, Math.min(body.n || 12, 20)) });
+  }
+  if (path === "/api/mem2/moment-vec-sweep" && method === "POST") {
+    return jsonResponse(await momentVecSweep(env, 200));
+  }
   if (path === "/api/mem2/status" && method === "GET") {
     const [wins, raws, l1, dirty, convs, lastrun, offConvs, offPending] = await Promise.all([
       env.DB.prepare("SELECT COUNT(*) AS c FROM archive_windows").first(),
@@ -8066,6 +8196,7 @@ ctx.waitUntil(runHeartbeat(env));
 ctx.waitUntil(runKeepalive(env).catch(() => {})); // 缓存保活（与心跳互相独立，零副作用）
 ctx.waitUntil(runIdle(env).catch(() => {}));  // 独处时间（2-2）：窗口/概率/上限判定都在函数内
 ctx.waitUntil(runDream(env).catch(() => {})); // 做梦（2-3）：仅 CN 4 点窗口真跑，每逻辑日一次
+ctx.waitUntil(runWaterReminder(env).catch(() => {})); // 喝水提醒：时段内落后进度才推
 ctx.waitUntil(processFeedReactions(env).catch(() => {})); // 朋友圈反应兜底拍：到期的路过/回评（没到期零开销）
 // 记忆类任务串行 + 按拍错峰：全并发时官方档案积压会挤爆单次调用的资源预算，
 // 整拍被无声掐死（2026-07-03 实测：卡死 16 小时，meta 停更）。
@@ -8078,6 +8209,7 @@ ctx.waitUntil((async () => {
   } else {
     await mem2ProcessVecQueue(env).catch(() => {});
     await runExtraction(env).catch(() => {});
+    await momentVecSweep(env).catch(() => {}); // 瞬记向量收敛：编辑重嵌/删除清幽灵/漏网补录
   }
 })());
 // CN 22:30（UTC 14:30）那次顺便生成 daily 日记
@@ -8389,6 +8521,16 @@ function logicalToday() {
 return new Date(Date.now() + 8 * 3600 * 1000 - 4 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
+// 某天喝水归一化视图：新明细（entries 每条 ml/kind/ts）与旧 {count} 数据都能读。
+// count 优先取明细条数；旧数据只有 count 时 total_ml 未知给 0。
+async function waterDay(env, date) {
+const rec = (await kvGet(env, `water:${date}`)) || {};
+const entries = Array.isArray(rec.entries) ? rec.entries : [];
+const count = entries.length || Number(rec.count) || 0;
+const total_ml = entries.reduce((s, e) => s + (Number(e.ml) || 0), 0);
+return { date, count, total_ml, entries, updated_at: rec.updated_at || null };
+}
+
 // "HH:MM"（东八区）
 function cnHHMM() {
 return cnNow().toISOString().slice(11, 16);
@@ -8412,6 +8554,43 @@ end: "03:00",
 cooldown_min: 30,
 monitor_apps: ["小红书", "微博", "B站", "抖音", "Safari"],
 };
+}
+
+// ── 喝水提醒：白天时段按间隔推送，落后进度才响 ─────────────
+function defaultWaterReminderConfig() {
+return { enabled: false, interval_min: 90, start_hour: 9, end_hour: 22, target_cups: 7 };
+}
+
+const WATER_NUDGES = [
+"该喝水了，今天才 {n} 杯",
+"喝口水吧，别让杯子闲着（今天 {n} 杯）",
+"水杯在等你，第 {next} 杯走起",
+"提醒：距离上次喝水有一会儿了，今天 {n} 杯",
+"补点水分吧，目标还差 {left} 杯",
+];
+
+// cron 每 30 分钟被唤醒：时段内 + 未达标 + 距上次喝水/上次提醒都超过间隔 → 推一条。
+async function runWaterReminder(env) {
+const cfg = (await kvGet(env, "config:water-reminder")) || defaultWaterReminderConfig();
+if (!cfg.enabled) return { skip: "disabled" };
+const cnHour = cnNow().getUTCHours();
+if (cnHour < cfg.start_hour || cnHour >= cfg.end_hour) return { skip: "outside-window" };
+const today = logicalToday();
+const day = await waterDay(env, today);
+if (day.count >= cfg.target_cups) return { skip: "target-met" };
+const intervalMs = cfg.interval_min * 60000;
+const lastDrink = day.entries.length ? new Date(day.entries[day.entries.length - 1].ts).getTime() : 0;
+if (lastDrink && Date.now() - lastDrink < intervalMs) return { skip: "drank-recently" };
+const lastRemind = await kvGet(env, "water-reminder:last");
+if (lastRemind?.ts && Date.now() - new Date(lastRemind.ts).getTime() < intervalMs) return { skip: "reminded-recently" };
+const left = Math.max(1, cfg.target_cups - day.count);
+const tpl = WATER_NUDGES[Math.floor(Math.random() * WATER_NUDGES.length)];
+const body = tpl.replace("{n}", String(day.count)).replace("{next}", String(day.count + 1)).replace("{left}", String(left));
+try {
+await sendPushNotification(env, { title: "喝水提醒", body, url: "/water", source: "water" });
+} catch { /* 推送失败不重试，等下一拍 */ }
+await kvPut(env, "water-reminder:last", { ts: now() });
+return { ok: true, sent: body };
 }
 
 // ════════════════════════════════════════════════════════════
@@ -9273,6 +9452,30 @@ cooldown_min: body.cooldown_min,
 monitor_apps: body.monitor_apps,
 };
 await kvPut(env, "config:night-guard", cfg);
+return jsonResponse({ success: true, config: cfg });
+}
+return jsonResponse({ error: "method not allowed" }, 405);
+}
+
+// 喝水提醒：白天时段按间隔推送，落后进度才响（cron 里 runWaterReminder 消费）
+if (path === "/api/config/water-reminder") {
+if (method === "GET") {
+const cfg = (await kvGet(env, "config:water-reminder")) || defaultWaterReminderConfig();
+return jsonResponse({ config: cfg });
+}
+if (method === "POST") {
+let body;
+try { body = await request.json(); }
+catch { return jsonResponse({ error: "invalid json" }, 400); }
+const cur = (await kvGet(env, "config:water-reminder")) || defaultWaterReminderConfig();
+// 部分更新：只认识的字段并入
+const cfg = { ...cur };
+if (typeof body.enabled === "boolean") cfg.enabled = body.enabled;
+if (Number.isInteger(body.interval_min) && body.interval_min >= 30 && body.interval_min <= 360) cfg.interval_min = body.interval_min;
+if (Number.isInteger(body.start_hour) && body.start_hour >= 0 && body.start_hour <= 23) cfg.start_hour = body.start_hour;
+if (Number.isInteger(body.end_hour) && body.end_hour >= 1 && body.end_hour <= 24) cfg.end_hour = body.end_hour;
+if (Number.isInteger(body.target_cups) && body.target_cups >= 1 && body.target_cups <= 20) cfg.target_cups = body.target_cups;
+await kvPut(env, "config:water-reminder", cfg);
 return jsonResponse({ success: true, config: cfg });
 }
 return jsonResponse({ error: "method not allowed" }, 405);
