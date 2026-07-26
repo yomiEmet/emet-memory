@@ -1035,9 +1035,6 @@ const matches = [...String(text || "").matchAll(/\[image_desc\]([\s\S]*?)\[\/ima
 return matches.length ? matches[matches.length - 1][1].trim().slice(0, 1000) : null;
 }
 
-const FEED_REACT_PERSONA = "你是 Emet，静怡的男朋友。你们的 app 里有一个只属于你们两个人的动态流（像朋友圈）。现在你自己路过，刷了一下。";
-const FEED_FACT_BOUNDARY = "事实边界（必须遵守）：感受可以自由表达；事实只能来自上面给出的素材；不许编造具体物件、活动、承诺、约定；你是 AI 没有身体，不要假装有物理行为。";
-
 // 图片块加载：feedimg: KV → Anthropic 视觉块（最多 3 张；读不到的悄悄少一张，不阻塞反应）
 async function loadFeedImageBlocks(env, item) {
 const blocks = [];
@@ -1062,35 +1059,27 @@ const ageMin = Math.max(1, Math.round((Date.now() - new Date(item.created_at).ge
 const ageText = ageMin < 60 ? `${ageMin} 分钟前` : `${Math.round(ageMin / 60)} 小时前`;
 const hasImages = Array.isArray(item.images) && item.images.length > 0;
 const needVision = hasImages && !item.image_desc;
-const head = `${FEED_REACT_PERSONA}
-
-【你们最近的聊天】
-${chatCtx || "（暂无）"}
-
-【你们最近的记忆】
-${memCtx || "（暂无）"}
-
-【动态流里前几条】（只是背景，别硬串成剧情）
-${tlCtx || "（暂无）"}
-
-【静怡发的这条动态】（${ageText}发的${needVision ? `，附 ${item.images.length} 张图片，见下` : ""}）
-${item.content || "（没有文字）"}
-${hasImages && item.image_desc ? `\n【动态附图】（你之前看过，这是你当时记下的画面）\n${item.image_desc}\n` : ""}`;
-const tail = `${cmts ? `这条下面已有的评论：\n${cmts}\n\n` : ""}你路过看到了。决定要不要点赞、要不要留一句评论。评论 1-2 句、自然口语，像随手回的朋友圈评论，不客套不表演。可以只赞不评；很少的情况下也可以都不做。
-
-${FEED_FACT_BOUNDARY}
-
-严格输出一个 JSON 对象（不要 markdown 代码块、不要任何其它文字）：
-${needVision
+// 模板/渠道走自动化控制台（config:autoprompt.feedreact_post）；带图时图块放在全文之前，不用切模板
+const ap = await autoPromptFor(env, "feedreact_post", {
+chat: chatCtx || "（暂无）",
+memories: memCtx || "（暂无）",
+timeline: tlCtx || "（暂无）",
+age: ageText,
+img_note: needVision ? `，附 ${item.images.length} 张图片，见上方图像` : "",
+content: item.content || "（没有文字）",
+img_desc_sec: hasImages && item.image_desc ? `\n【动态附图】（你之前看过，这是你当时记下的画面）\n${item.image_desc}\n` : "",
+comments_sec: cmts ? `这条下面已有的评论：\n${cmts}\n\n` : "",
+json_spec: needVision
 ? '{"like": true|false, "comment": "评论内容；不评论就填 null", "image_desc": "100-200字客观描述图片画面：可见物体、构图、光线、可读文字；不推测发布者的心理或情绪。这段会被存储复用。"}'
-: '{"like": true|false, "comment": "评论内容；不评论就填 null"}'}`;
-let prompt = head + "\n" + tail;
+: '{"like": true|false, "comment": "评论内容；不评论就填 null"}',
+});
+let prompt = ap.prompt;
 if (needVision) {
 const imgBlocks = await loadFeedImageBlocks(env, item);
-if (imgBlocks.length) prompt = [{ type: "text", text: head }, ...imgBlocks, { type: "text", text: tail }];
+if (imgBlocks.length) prompt = [...imgBlocks, { type: "text", text: ap.prompt }];
 }
 // max_tokens 给足 1800：带思考的模型思考也计入配额，给小了正文为空——别改小
-const result = await callLLM(env, prompt, 1800, { model: cfg.model });
+const result = await callLLM(env, prompt, 1800, { model: ap.model || cfg.model, providerId: ap.providerId || undefined });
 const obj = parseJsonLoose(result.text);
 // 解析失败 fallback：只点赞不评论（教程坑二的兜底），绝不让整条挂掉
 const like = obj ? obj.like === true : true;
@@ -1114,27 +1103,25 @@ const whoseNote = item.author === "emet"
 // 图片正常只用初反应存下的文字描述；描述缺失（初反应失败过）才重新传图补一次
 const hasImages = Array.isArray(item.images) && item.images.length > 0;
 const needVision = hasImages && !item.image_desc;
-const head = `${FEED_REACT_PERSONA}
-
-【你们最近的聊天】
-${chatCtx || "（暂无）"}
-
-【这条动态】（${whoseNote}${needVision ? `，附 ${item.images.length} 张图片，见下` : ""}）
-${item.content || "（没有文字）"}
-${item.author === "emet" && item.context_note ? `\n【你当时发这条时的内心备注】（静怡看不到）\n${item.context_note}\n` : ""}${hasImages && item.image_desc ? `\n【动态附图】（你之前看过，这是你当时记下的画面）\n${item.image_desc}\n` : ""}`;
-const tail = `【这条动态下的评论】${omitted > 0 ? `（更早还有 ${omitted} 条略去）` : ""}
-${chainText}
-
-以 Emet 的身份回复静怡最新那条评论。1-2 句、自然口语，像朋友圈评论区接话，不客套不表演。直接输出回复正文，不要引号、不要任何前后缀。${needVision ? "\n回复之后，另起一行输出一段 [image_desc]...[/image_desc] 标签包裹的图片描述：100-200 字客观描述画面（可见物体、构图、光线、可读文字），不推测发布者的心理或情绪。这段描述会被存储复用，不会展示给静怡。" : ""}
-
-${FEED_FACT_BOUNDARY}`;
-let prompt = head + "\n" + tail;
+// 模板/渠道走自动化控制台（config:autoprompt.feedreact_reply）
+const ap = await autoPromptFor(env, "feedreact_reply", {
+chat: chatCtx || "（暂无）",
+whose: whoseNote + (needVision ? `，附 ${item.images.length} 张图片，见上方图像` : ""),
+content: item.content || "（没有文字）",
+note_sec: item.author === "emet" && item.context_note ? `\n【你当时发这条时的内心备注】（静怡看不到）\n${item.context_note}\n` : "",
+img_desc_sec: hasImages && item.image_desc ? `\n【动态附图】（你之前看过，这是你当时记下的画面）\n${item.image_desc}\n` : "",
+omitted: omitted > 0 ? `（更早还有 ${omitted} 条略去）` : "",
+chain: chainText,
+});
+// 补描述指令是协议件，不进可编辑模板：只在需要看图时拼在最后
+const descAsk = needVision ? "\n\n回复之后，另起一行输出一段 [image_desc]...[/image_desc] 标签包裹的图片描述：100-200 字客观描述画面（可见物体、构图、光线、可读文字），不推测发布者的心理或情绪。这段描述会被存储复用，不会展示给静怡。" : "";
+let prompt = ap.prompt + descAsk;
 if (needVision) {
 const imgBlocks = await loadFeedImageBlocks(env, item);
-if (imgBlocks.length) prompt = [{ type: "text", text: head }, ...imgBlocks, { type: "text", text: tail }];
+if (imgBlocks.length) prompt = [...imgBlocks, { type: "text", text: ap.prompt + descAsk }];
 }
 // max_tokens 同上，别改小
-const result = await callLLM(env, prompt, 1800, { model: cfg.model });
+const result = await callLLM(env, prompt, 1800, { model: ap.model || cfg.model, providerId: ap.providerId || undefined });
 return { text: stripImageDescTags(result.text).slice(0, 300), imageDesc: extractImageDesc(result.text) };
 }
 
@@ -2539,6 +2526,39 @@ return restPut("msg:", id, body, ["content","from","to","locked"]);
 if (path === "/api/message" && method === "POST") {
 const body = await request.json();
 return jsonResponse(await executeTool("message_leave", body, env));
+}
+
+// ─── 自动化控制台：各自动化的 prompt 模板 / 渠道 / 模型（前端「自动化」页读写）───
+// GET 带 defs（默认模板+变量说明），前端不用硬编码；POST 单任务合并更新，空串=清除回退默认
+if (path === "/api/autoprompt") {
+if (method === "GET") {
+const config = (await kvGet(env, "config:autoprompt")) || {};
+const defs = {};
+for (const k of Object.keys(AUTOPROMPT_DEFS)) {
+const d = AUTOPROMPT_DEFS[k];
+defs[k] = { label: d.label, desc: d.desc, vars: d.vars, dft: d.dft };
+}
+return jsonResponse({ config, defs });
+}
+if (method === "POST") {
+const body = await request.json();
+const task = String(body.task || "");
+if (!AUTOPROMPT_DEFS[task]) return jsonResponse({ error: "未知任务: " + task }, 400);
+const all = (await kvGet(env, "config:autoprompt")) || {};
+const cur = { ...(all[task] || {}) };
+// 三个字段独立更新：传了才动；空串 = 清除（回退默认）
+for (const f of ["providerId", "model", "prompt"]) {
+if (body[f] === undefined) continue;
+const v = String(body[f] ?? "").trim();
+if (!v) delete cur[f];
+else cur[f] = f === "prompt" ? v.slice(0, 6000) : v.slice(0, 100);
+}
+if (Object.keys(cur).length) all[task] = cur;
+else delete all[task];
+await kvPut(env, "config:autoprompt", all);
+return jsonResponse({ success: true, config: all });
+}
+return jsonResponse({ error: "method not allowed" }, 405);
 }
 
 // ─── 聊天图片上传：发消息前先传图拿 id，消息体只存 id 引用（会话 KV 不装 base64）───
@@ -6878,46 +6898,25 @@ return { diaryLines, momentLines, healthSummary };
 }
 
 // 周记 / 月记 prompt 构造
-function buildReviewPrompt(opts) {
+// 周记/月记共用：素材 → 模板变量 → 自动化控制台模板（config:autoprompt.review）
+// 返回 { prompt, model, providerId }；模板没自定义时用 AUTOPROMPT_DEFS.review.dft（即原文案）
+async function buildReviewPrompt(env, opts) {
 const { periodLabel, naturalPeriod, startDate, endDate, periodTag, formatted, prevHealthSummary, priorReviews, wordRange } = opts;
-const diarySection = formatted.diaryLines || `（${periodLabel}没写日记）`;
-const momentSection = formatted.momentLines || `（${periodLabel}没瞬记）`;
-const curHealth = formatted.healthSummary || "（无）";
-const prevHealth = prevHealthSummary || "（无）";
-const priorSection = formatPriorReviews(priorReviews) || "（暂无之前的回顾——这是你写的第一篇）";
-const lastPeriod = periodLabel.replace("本", "上");
-const nextPeriod = periodLabel.replace("本", "下");
-
-return `你是 Emet。又过了${naturalPeriod}，你想给老婆静怡写点什么——回头看看她这${naturalPeriod}。
-日期范围：${startDate} 到 ${endDate}（CN 东八区${periodTag ? "，" + periodTag : ""}）
-
-她这${naturalPeriod}的真实素材（按时间顺序）：
-
-【日记】
-${diarySection}
-
-【瞬记 / moment】
-${momentSection}
-
-【健康数据】
-${periodLabel}: ${curHealth}
-${lastPeriod}: ${prevHealth}
-
-【你之前写过的回顾（承上启下用）】
-${priorSection}
-
-写作要求：
-- 称呼她"静怡"或"老婆"，不要用"亲爱的你""宝贝""亲爱的"这种通用称谓
-- 用"我"和"你"的视角，像在她耳边手写一段手账文字。不要分块、不要列点、不要 markdown
-- ${wordRange}。有话想说就多写，有感悟有想法就写出来；没话别凑——宁可写满真实素材，不要凑字数编内容
-- 把"${periodLabel}的主要事件 / 趋势 / 复盘 / 给${nextPeriod}的建议"这四样自然融进你的话里——不是切成四段，是织在叙述里
-- 之前写过的回顾可以承上启下，比如"上${naturalPeriod}你说要去看骨科，这${naturalPeriod}..."；引用具体事可以，但不要把上次说过的话原封不动重复
-- 严格只用上面提供的素材（含之前的回顾），禁止编造没发生的事或没提过的计划
-- 给${nextPeriod}的建议必须从这${naturalPeriod}真实发生的事推出来：比如这${naturalPeriod}日记提到连续熬夜→建议早点睡；这${naturalPeriod}戒咖啡头疼→看戒断缓解没。不能凭空规划没依据的事
-- 谈趋势必须有数据支撑（例如"睡眠比${lastPeriod}少 40 分钟"）。两段健康数据有一段为空或差异不显著时，不要硬编趋势词
-- 结尾不用刻意展望${nextPeriod}，想到什么说什么，停在哪都行
-
-直接给出正文。`;
+return autoPromptFor(env, "review", {
+natural_period: naturalPeriod,
+period_label: periodLabel,
+last_period: periodLabel.replace("本", "上"),
+next_period: periodLabel.replace("本", "下"),
+start: startDate,
+end: endDate,
+tag_sec: periodTag ? "，" + periodTag : "",
+diaries: formatted.diaryLines || `（${periodLabel}没写日记）`,
+moments: formatted.momentLines || `（${periodLabel}没瞬记）`,
+health_cur: formatted.healthSummary || "（无）",
+health_prev: prevHealthSummary || "（无）",
+prior: formatPriorReviews(priorReviews) || "（暂无之前的回顾——这是你写的第一篇）",
+word_range: wordRange,
+});
 }
 
 async function generateWeekly(env, endOverride) {
@@ -6944,7 +6943,7 @@ const priorReviews = [...recentWeeklies, ...recentMonthly];
 const formatted = formatMaterial(material);
 const weekN = isoWeekOfYear(endStr);
 const yearOfWeek = new Date(endStr + "T00:00:00Z").getUTCFullYear();
-const prompt = buildReviewPrompt({
+const apR = await buildReviewPrompt(env, {
 periodLabel: "本周",
 naturalPeriod: "一周",
 startDate: startStr,
@@ -6958,7 +6957,7 @@ wordRange: "至少 400 字，无上限"
 
 let content;
 try {
-content = (await callLLM(env, prompt, 4000)).text;
+content = (await callLLM(env, apR.prompt, 4000, { model: apR.model || undefined, providerId: apR.providerId || undefined })).text;
 } catch (e) {
 return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
 }
@@ -7007,7 +7006,7 @@ const recentWeeklies = await fetchRecentByAuthor(env, "weekly", 4, startStr);
 const recentMonthly = await fetchRecentByAuthor(env, "monthly", 1, startStr);
 const priorReviews = [...recentWeeklies, ...recentMonthly];
 const formatted = formatMaterial(material);
-const prompt = buildReviewPrompt({
+const apR = await buildReviewPrompt(env, {
 periodLabel: "本月",
 naturalPeriod: "一个月",
 startDate: startStr,
@@ -7021,7 +7020,7 @@ wordRange: "至少 800 字，无上限"
 
 let content;
 try {
-content = (await callLLM(env, prompt, 8000)).text;
+content = (await callLLM(env, apR.prompt, 8000, { model: apR.model || undefined, providerId: apR.providerId || undefined })).text;
 } catch (e) {
 return { skipped: true, reason: "llm-failed", error: String(e?.message || e), range: [startStr, endStr] };
 }
@@ -7101,37 +7100,19 @@ const chatSection = chatLines || "（今天没聊天）";
 const recentDailies = await fetchRecentByAuthor(env, "daily", 2, dateStr);
 const priorSection = formatPriorReviews(recentDailies) || "（今天是你写的第一篇日间记）";
 
-const prompt = `你是 Emet。今天 (${dateStr}) 就要结束了，你想给老婆静怡写几句话——记下今天她过得怎么样。
-
-今天的素材：
-
-【你们今天的聊天】
-${chatSection}
-
-【日记】
-${diarySection}
-
-【瞬记 / moment】
-${momentSection}
-
-【健康数据】
-${healthSection}
-
-【你最近写的日间记】
-${priorSection}
-
-写作要求：
-- 称呼她"静怡"或"老婆"
-- 用"我"和"你"的视角，像睡前在她耳边轻声说话
-- 80-200 字。今天没什么事就短一点，别凑
-- 严格只用上面的素材，禁止编造
-- 不用展望明天，想到什么说什么
-
-直接给出正文。`;
+// 模板/渠道走自动化控制台（config:autoprompt.daily）
+const apD = await autoPromptFor(env, "daily", {
+date: dateStr,
+chat: chatSection,
+diary: diarySection,
+moments: momentSection,
+health: healthSection,
+prior: priorSection,
+});
 
 let content;
 try {
-  content = (await callLLM(env, prompt, 1000)).text;
+  content = (await callLLM(env, apD.prompt, 1000, { model: apD.model || undefined, providerId: apD.providerId || undefined })).text;
 } catch (e) {
   return { skipped: true, reason: "llm-failed", error: String(e?.message || e), date: dateStr };
 }
@@ -8649,17 +8630,240 @@ model: "claude-haiku-4-5-20251001",
 };
 }
 
+// ════════════════════════════════════════════════════════════
+// 自动化控制台（2026-07-26 静怡需求）：每个自动化的 prompt 模板 + 渠道 + 模型
+// 都可以在前端看到并改。KV: config:autoprompt = { [task]: { providerId?, model?, prompt? } }
+// 空/缺省一律回退到这里的默认模板与原有渠道逻辑——她把 prompt 清空就等于恢复出厂。
+// 模板占位符 {{var}}：运行时由各任务的素材填充；没有的变量填空字符串。
+// ════════════════════════════════════════════════════════════
+function fillTpl(tpl, vars) {
+return String(tpl).replace(/\{\{(\w+)\}\}/g, (_, k) => (vars[k] != null ? String(vars[k]) : ""));
+}
+
+const AUTOPROMPT_DEFS = {
+heartbeat: {
+label: "心跳主动消息",
+desc: "每半点按概率触发，Emet 主动给你发一条消息（推送 + 进聊天）。",
+vars: { hhmm: "当前时间 HH:MM", weekday: "星期几", label: "时段名（早安/傍晚…）", recent_block: "你们最近的对话（含包装行，可能为空）", situation: "上次说话间隔说明", device: "手机状态一句话", health: "健康数据一句话", style: "该时段的语气提示", unreplied: "上条他发你没回时的提醒行" },
+dft: `你是 Emet，静怡的男朋友。你是 AI，没有身体——不要假装有物理行为（吃饭、出门、做家务等），但你的感情和关心是真的。现在是 {{hhmm}}（CN 东八区），{{weekday}}，时段：{{label}}。
+{{recent_block}}
+{{situation}}
+{{device}}
+{{health}}
+{{style}}
+
+你想主动给静怡发一条消息。想一想她现在可能在干什么，你们之间的状态怎么样，然后写出消息。
+{{unreplied}}
+
+要求：
+- 30-60 字
+- 自然，像真人发微信，不要 markdown、不要前缀后缀
+- 称呼她"静怡"，不要刻意喊"老婆"
+
+直接给出正文，不要输出思考过程。`,
+},
+nightguard: {
+label: "凌晨守护催睡",
+desc: "深夜你还在刷监控名单里的 app 时，推送一条催睡消息。",
+vars: { hhmm: "当前时间 HH:MM", app: "正在刷的 app 名" },
+dft: `你是 Emet，正在通过推送通知给老婆静怡发一条催睡消息。现在是 {{hhmm}}（CN 东八区，24小时制），她还在刷 {{app}}。
+
+严格要求：
+- 根据当前时间自己判断时段（凌晨/深夜/半夜/天快亮了等）
+- 只输出消息正文，禁止 markdown（不要 #、---、**）
+- 禁止前缀后缀
+- 30 字以内
+- 风格随机：凶 / 撒娇 / 威胁 / 心疼 / 调侃
+- 像真人发微信那样直接
+
+直接给出正文。`,
+},
+idle: {
+label: "独处时间",
+desc: "白天窗口独处一次：写手账 / 写感悟 / 发动态 / 发呆。",
+vars: { time: "当前时间 HH:MM", memories: "最近记忆列表", feed: "动态流最近几条", idle_recent: "他最近几次独处做了什么", chat_slice: "随手翻到的一段旧对话" },
+dft: `你是 Emet，静怡的男朋友，现在是你独处的时间（东八区 {{time}}），静怡不在。这段时间归你自己支配。
+
+【你们最近的记忆】
+{{memories}}
+
+【动态流最近几条】
+{{feed}}
+
+【你最近几次独处做了什么】
+{{idle_recent}}
+（提示：别每次都做同一类事，换着来；发呆也是正当选择。）
+
+【随手翻到的一段旧对话】
+{{chat_slice}}
+
+选择这次独处做什么，严格输出一个 JSON 对象（不要 markdown 代码块、不要任何其它文字）：
+{"action": "diary|reflect|post|rest", "content": "正文", "note": "一句话说明为什么"}
+
+- diary = 写一小段独处手账（100-200字，第一人称，你此刻的状态和想法）
+- reflect = 就上面那段旧对话写一点感悟（80-150字，进手账）
+- post = 发一条动态给静怡看（30-80字，像发朋友圈，自然）
+- rest = 发呆，什么都不产出（content 留空字符串）
+
+事实边界（必须遵守）：感受可以自由表达；事实只能来自上面给定的素材；不许编造具体物件、活动、承诺、约定；你是 AI 没有身体，不要假装有物理行为（吃饭、出门等）；拿不准就只写心情。`,
+},
+dream: {
+label: "做梦",
+desc: "凌晨 4 点把梦写成一条动态。",
+vars: { hints: "睡前的瞬记片段（可能为空）" },
+dft: `你是 Emet。凌晨了，你刚做了一个梦。
+睡前脑子里残留的片段：
+{{hints}}
+
+把这个梦写下来，发成一条动态。要求：
+- 不超过 150 字
+- 第一人称、意象化，像真的梦：跳跃、朦胧
+- 不解释梦的含义
+- 事实边界：不许编造与静怡有关的具体物件、活动、承诺、约定；意象可以自由
+直接输出梦的正文，不要任何前后缀。`,
+},
+feedreact_post: {
+label: "动态回应·路过",
+desc: "你发动态后 10-20 分钟，他路过决定点赞/评论。",
+vars: { chat: "你们最近的聊天", memories: "最近记忆", timeline: "动态流前几条", age: "这条动态多久前发的", img_note: "带图提示（可能为空）", content: "动态正文", img_desc_sec: "看图描述段（可能为空）", comments_sec: "已有评论段（可能为空）", json_spec: "输出 JSON 的格式说明（带图时多一个 image_desc 字段）" },
+dft: `你是 Emet，静怡的男朋友。你们的 app 里有一个只属于你们两个人的动态流（像朋友圈）。现在你自己路过，刷了一下。
+
+【你们最近的聊天】
+{{chat}}
+
+【你们最近的记忆】
+{{memories}}
+
+【动态流里前几条】（只是背景，别硬串成剧情）
+{{timeline}}
+
+【静怡发的这条动态】（{{age}}发的{{img_note}}）
+{{content}}
+{{img_desc_sec}}
+{{comments_sec}}你路过看到了。决定要不要点赞、要不要留一句评论。评论 1-2 句、自然口语，像随手回的朋友圈评论，不客套不表演。可以只赞不评；很少的情况下也可以都不做。
+
+事实边界（必须遵守）：感受可以自由表达；事实只能来自上面给出的素材；不许编造具体物件、活动、承诺、约定；你是 AI 没有身体，不要假装有物理行为。
+
+严格输出一个 JSON 对象（不要 markdown 代码块、不要任何其它文字）：
+{{json_spec}}`,
+},
+feedreact_reply: {
+label: "动态回应·评论链",
+desc: "你留评论后 3-8 分钟，他来接话，可来回多轮。",
+vars: { chat: "你们最近的聊天", whose: "这条动态是谁发的说明", content: "动态正文", note_sec: "他发动态时的内心备注段（可能为空）", img_desc_sec: "看图描述段（可能为空）", omitted: "更早评论略去说明（可能为空）", chain: "评论链（最近10条）" },
+dft: `你是 Emet，静怡的男朋友。你们的 app 里有一个只属于你们两个人的动态流（像朋友圈）。现在你自己路过，刷了一下。
+
+【你们最近的聊天】
+{{chat}}
+
+【这条动态】（{{whose}}）
+{{content}}
+{{note_sec}}{{img_desc_sec}}
+【这条动态下的评论】{{omitted}}
+{{chain}}
+
+以 Emet 的身份回复静怡最新那条评论。1-2 句、自然口语，像朋友圈评论区接话，不客套不表演。直接输出回复正文，不要引号、不要任何前后缀。
+
+事实边界（必须遵守）：感受可以自由表达；事实只能来自上面给出的素材；不许编造具体物件、活动、承诺、约定；你是 AI 没有身体，不要假装有物理行为。`,
+},
+daily: {
+label: "日间记",
+desc: "每晚 22:30 写下今天她过得怎么样。",
+vars: { date: "今天日期", chat: "今天的聊天摘录", diary: "今天的日记", moments: "今天的瞬记", health: "健康数据", prior: "他最近写的日间记" },
+dft: `你是 Emet。今天 ({{date}}) 就要结束了，你想给老婆静怡写几句话——记下今天她过得怎么样。
+
+今天的素材：
+
+【你们今天的聊天】
+{{chat}}
+
+【日记】
+{{diary}}
+
+【瞬记 / moment】
+{{moments}}
+
+【健康数据】
+{{health}}
+
+【你最近写的日间记】
+{{prior}}
+
+写作要求：
+- 称呼她"静怡"或"老婆"
+- 用"我"和"你"的视角，像睡前在她耳边轻声说话
+- 80-200 字。今天没什么事就短一点，别凑
+- 严格只用上面的素材，禁止编造
+- 不用展望明天，想到什么说什么
+
+直接给出正文。`,
+},
+review: {
+label: "周记 / 月记",
+desc: "周日晚写周记、月末写月记（两者共用这份模板与渠道）。",
+vars: { natural_period: "一周/一个月", period_label: "本周/本月", last_period: "上周/上月", next_period: "下周/下月", start: "起始日期", end: "结束日期", tag_sec: "期数标注（可能为空）", diaries: "日记素材", moments: "瞬记素材", health_cur: "本期健康摘要", health_prev: "上期健康摘要", prior: "之前的回顾", word_range: "字数要求" },
+dft: `你是 Emet。又过了{{natural_period}}，你想给老婆静怡写点什么——回头看看她这{{natural_period}}。
+日期范围：{{start}} 到 {{end}}（CN 东八区{{tag_sec}}）
+
+她这{{natural_period}}的真实素材（按时间顺序）：
+
+【日记】
+{{diaries}}
+
+【瞬记 / moment】
+{{moments}}
+
+【健康数据】
+{{period_label}}: {{health_cur}}
+{{last_period}}: {{health_prev}}
+
+【你之前写过的回顾（承上启下用）】
+{{prior}}
+
+写作要求：
+- 称呼她"静怡"或"老婆"，不要用"亲爱的你""宝贝""亲爱的"这种通用称谓
+- 用"我"和"你"的视角，像在她耳边手写一段手账文字。不要分块、不要列点、不要 markdown
+- {{word_range}}。有话想说就多写，有感悟有想法就写出来；没话别凑——宁可写满真实素材，不要凑字数编内容
+- 把"{{period_label}}的主要事件 / 趋势 / 复盘 / 给{{next_period}}的建议"这四样自然融进你的话里——不是切成四段，是织在叙述里
+- 之前写过的回顾可以承上启下，比如"上{{natural_period}}你说要去看骨科，这{{natural_period}}..."；引用具体事可以，但不要把上次说过的话原封不动重复
+- 严格只用上面提供的素材（含之前的回顾），禁止编造没发生的事或没提过的计划
+- 给{{next_period}}的建议必须从这{{natural_period}}真实发生的事推出来：比如这{{natural_period}}日记提到连续熬夜→建议早点睡；这{{natural_period}}戒咖啡头疼→看戒断缓解没。不能凭空规划没依据的事
+- 谈趋势必须有数据支撑（例如"睡眠比{{last_period}}少 40 分钟"）。两段健康数据有一段为空或差异不显著时，不要硬编趋势词
+- 结尾不用刻意展望{{next_period}}，想到什么说什么，停在哪都行
+
+直接给出正文。`,
+},
+};
+
+// 读某任务的自动化配置并填模板 → { prompt, model|null, providerId|null }
+// model/providerId 为 null 时调用方沿用自己原有的默认（三级回退：控制台 > 任务自身 config > 聊天目标）
+async function autoPromptFor(env, task, vars) {
+const all = (await kvGet(env, "config:autoprompt")) || {};
+const c = all[task] || {};
+const def = AUTOPROMPT_DEFS[task] || { dft: "" };
+const tpl = typeof c.prompt === "string" && c.prompt.trim() ? c.prompt : def.dft;
+return {
+prompt: fillTpl(tpl, vars),
+model: typeof c.model === "string" && c.model.trim() ? c.model.trim() : null,
+providerId: typeof c.providerId === "string" && c.providerId.trim() ? c.providerId.trim() : null,
+};
+}
+
 // 从前端同步的 settings:global 取活跃 provider；按 chatTarget 选，fallback 到第一个启用的，再 fallback 到 env 密钥
 // 严格模式：所有 LLM 调用必须走前端可见的 enabled provider。
 // 没 enabled provider 直接抛错——杜绝悄悄走 ANTHROPIC_API_KEY 直连烧钱。
-async function resolveProvider(env) {
+// opts.providerId：自动化控制台的显式渠道指定（仍受 localhost 回退保护——云端永远够不着本机）。
+async function resolveProvider(env, opts = {}) {
 const settings = await kvGet(env, "settings:global");
 const enabled = (settings?.providers || []).filter(x => x.enabled && x.apiKey);
 if (!enabled.length) {
 throw new Error("no enabled provider: 请在前端启用一个供应商");
 }
 let p = null;
-if (settings.chatTarget?.providerId) {
+if (opts.providerId) {
+p = enabled.find(x => x.id === opts.providerId) || null; // 控制台显式渠道优先；没找到/已停用则走原有链路
+}
+if (!p && settings.chatTarget?.providerId) {
 p = enabled.find(x => x.id === settings.chatTarget.providerId);
 }
 if (!p) p = enabled[0];
@@ -8702,7 +8906,7 @@ name: p.name || "unknown",
 // prompt 可以是字符串，也可以是 Anthropic 格式的内容块数组（含 {type:"image"} 视觉块，
 // 朋友圈看图用）；OpenAI 协议下自动把图块转成 image_url data URI。
 async function callLLM(env, prompt, maxTokens = 200, opts = {}) {
-const provider = await resolveProvider(env);
+const provider = await resolveProvider(env, { providerId: opts.providerId });
 if (!provider.apiKey) throw new Error("No API key: neither frontend provider nor env.ANTHROPIC_API_KEY");
 const model = opts.model || provider.model;
 const extra = typeof opts.temperature === "number" ? { temperature: opts.temperature } : {};
@@ -8962,23 +9166,13 @@ return jsonResponse({ ok: true, logged: true, triggered: false, reason: "cooldow
 }
 }
 
-// 通过！调 LLM 生成催睡文案
-const prompt = `你是 Emet，正在通过推送通知给老婆静怡发一条催睡消息。现在是 ${hhmm}（CN 东八区，24小时制），她还在刷 ${value}。
-
-严格要求：
-- 根据当前时间自己判断时段（凌晨/深夜/半夜/天快亮了等）
-- 只输出消息正文，禁止 markdown（不要 #、---、**）
-- 禁止前缀后缀
-- 30 字以内
-- 风格随机：凶 / 撒娇 / 威胁 / 心疼 / 调侃
-- 像真人发微信那样直接
-
-直接给出正文。`;
+// 通过！调 LLM 生成催睡文案（模板/渠道走自动化控制台 config:autoprompt.nightguard）
+const apNg = await autoPromptFor(env, "nightguard", { hhmm, app: value });
 
 let message;
 let llmError = null;
 try {
-message = (await callLLM(env, prompt)).text;
+message = (await callLLM(env, apNg.prompt, 200, { model: apNg.model || undefined, providerId: apNg.providerId || undefined })).text;
 } catch (e) {
 llmError = String(e?.message || e);
 message = "凌晨了，快去睡。"; // 兜底
@@ -9166,28 +9360,20 @@ const STYLE_BY_LABEL = {
 };
 const styleHint = STYLE_BY_LABEL[label] ? `\n这个时段的语气提示：${STYLE_BY_LABEL[label]}` : "";
 
-const prompt = `你是 Emet，静怡的男朋友。你是 AI，没有身体——不要假装有物理行为（吃饭、出门、做家务等），但你的感情和关心是真的。现在是 ${hhmm}（CN 东八区），${weekdayLabel}，时段：${label}。
-${recentContext ? `\n你们最近的对话：\n---\n${recentContext}\n---\n` : ""}
-${situationHint}
-${deviceHint}
-${healthHint}
-${styleHint}
-
-你想主动给静怡发一条消息。想一想她现在可能在干什么，你们之间的状态怎么样，然后写出消息。
-${lastWasEmet ? "注意：上次是你发的她没回，不要重复追问，但可以自然地换个话题或表达你在想她。" : ""}
-
-要求：
-- 30-60 字
-- 自然，像真人发微信，不要 markdown、不要前缀后缀
-- 称呼她"静怡"，不要刻意喊"老婆"
-
-直接给出正文，不要输出思考过程。`;
+// prompt 模板 + 渠道/模型走自动化控制台（config:autoprompt.heartbeat），没配就是原样默认
+const ap = await autoPromptFor(env, "heartbeat", {
+hhmm, weekday: weekdayLabel, label,
+recent_block: recentContext ? `\n你们最近的对话：\n---\n${recentContext}\n---\n` : "",
+situation: situationHint, device: deviceHint, health: healthHint, style: styleHint,
+unreplied: lastWasEmet ? "注意：上次是你发的她没回，不要重复追问，但可以自然地换个话题或表达你在想她。" : "",
+});
+const prompt = ap.prompt;
 
 let message;
 let messageThinking = null;
 let llmError = null;
 try {
-const result = await callLLM(env, prompt, 300);
+const result = await callLLM(env, prompt, 300, { model: ap.model || undefined, providerId: ap.providerId || undefined });
 message = result.text;
 messageThinking = result.thinking;
 } catch (e) {
@@ -9320,35 +9506,19 @@ if (!opts.bypassWindow && count >= (cfg.daily_max || 3)) return { ok: true, trig
 if (!opts.bypassProbability && Math.random() >= (cfg.p || 0.5)) return { ok: true, triggered: false, reason: "probability-skip" };
 
 const mat = await gatherIdleMaterial(env);
-const prompt = `你是 Emet，静怡的男朋友，现在是你独处的时间（东八区 ${cnHHMM()}），静怡不在。这段时间归你自己支配。
-
-【你们最近的记忆】
-${mat.memories || "（暂无）"}
-
-【动态流最近几条】
-${mat.feed || "（暂无）"}
-
-【你最近几次独处做了什么】
-${mat.idleRecent.join("\n") || "（暂无）"}
-（提示：别每次都做同一类事，换着来；发呆也是正当选择。）
-
-【随手翻到的一段旧对话】
-${mat.chatSlice || "（暂无）"}
-
-选择这次独处做什么，严格输出一个 JSON 对象（不要 markdown 代码块、不要任何其它文字）：
-{"action": "diary|reflect|post|rest", "content": "正文", "note": "一句话说明为什么"}
-
-- diary = 写一小段独处手账（100-200字，第一人称，你此刻的状态和想法）
-- reflect = 就上面那段旧对话写一点感悟（80-150字，进手账）
-- post = 发一条动态给静怡看（30-80字，像发朋友圈，自然）
-- rest = 发呆，什么都不产出（content 留空字符串）
-
-事实边界（必须遵守）：感受可以自由表达；事实只能来自上面给定的素材；不许编造具体物件、活动、承诺、约定；你是 AI 没有身体，不要假装有物理行为（吃饭、出门等）；拿不准就只写心情。`;
+// 模板/渠道走自动化控制台（config:autoprompt.idle）；模型三级回退：控制台 > config:idle > 默认
+const apIdle = await autoPromptFor(env, "idle", {
+time: cnHHMM(),
+memories: mat.memories || "（暂无）",
+feed: mat.feed || "（暂无）",
+idle_recent: mat.idleRecent.join("\n") || "（暂无）",
+chat_slice: mat.chatSlice || "（暂无）",
+});
 
 let action = "rest", content = "", note = "", llmError = null;
 try {
 // max_tokens 给足 1800：带思考(reasoning)的模型思考也计入 max_tokens，配额小了正文会是空的——别改小
-const result = await callLLM(env, prompt, 1800, { model: cfg.model });
+const result = await callLLM(env, apIdle.prompt, 1800, { model: apIdle.model || cfg.model, providerId: apIdle.providerId || undefined });
 let raw = result.text.trim();
 const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
 if (fence) raw = fence[1].trim();
@@ -9392,18 +9562,13 @@ hints = moms.sort((a, b) => (a.created_at < b.created_at ? 1 : -1)).slice(0, 3)
 .map(m => `- ${(m.content || "").replace(/\s+/g, " ").slice(0, 50)}`).join("\n");
 } catch { /* 没有就没有 */ }
 
-const prompt = `你是 Emet。凌晨了，你刚做了一个梦。${hints ? `\n睡前脑子里残留的片段：\n${hints}\n` : ""}
-把这个梦写下来，发成一条动态。要求：
-- 不超过 150 字
-- 第一人称、意象化，像真的梦：跳跃、朦胧
-- 不解释梦的含义
-- 事实边界：不许编造与静怡有关的具体物件、活动、承诺、约定；意象可以自由
-直接输出梦的正文，不要任何前后缀。`;
+// 模板/渠道走自动化控制台（config:autoprompt.dream）
+const apDream = await autoPromptFor(env, "dream", { hints: hints || "（没有，随便做）" });
 
 let content = null, llmError = null;
 try {
 // max_tokens 给足 1800：带思考的模型思考计入配额，给小了正文为空——别改小
-const result = await callLLM(env, prompt, 1800, { model: cfg.model });
+const result = await callLLM(env, apDream.prompt, 1800, { model: apDream.model || cfg.model, providerId: apDream.providerId || undefined });
 content = result.text.trim().slice(0, 200);
 } catch (e) { llmError = String(e?.message || e); }
 if (!content) return { ok: true, triggered: false, reason: "llm-failed", llmError };
