@@ -968,10 +968,10 @@ if (item.image_desc) base.image_desc = item.image_desc;
 return base;
 }
 
-// 存图：base64 直接进 KV（feedimg:<id>，单值远低于 KV 25MB 上限）。
-// 前端发布前已压缩到几百 KB；这里再设 2MB 正文硬上限，超限报错而不是悄悄丢
-// （写路径必须验真落库——worker 错误当 200 的坑，见 2026-07 复盘）。
-async function storeFeedImages(env, images) {
+// 存图：base64 直接进 KV（<prefix>:<id>，单值远低于 KV 25MB 上限）。动态与聊天共用一套，
+// 前缀分开（feedimg: / chatimg:）互不越界。前端发布前已压缩到几百 KB；这里再设 2MB 正文硬上限，
+// 超限报错而不是悄悄丢（写路径必须验真落库——worker 错误当 200 的坑，见 2026-07 复盘）。
+async function storeImagesKV(env, images, prefix) {
 if (!Array.isArray(images) || !images.length) return null;
 const ids = [];
 for (const img of images.slice(0, 3)) {
@@ -988,6 +988,7 @@ ids.push(id);
 }
 return ids.length ? ids : null;
 }
+const storeFeedImages = (env, images) => storeImagesKV(env, images, "feedimg");
 
 // 反应上下文·近期聊天：最近活跃会话的最后 8 条、每条截 160 字——她当下情绪的最强信号
 // （昨晚刚吵完架，今天发了张开心的猫，不知道昨晚的状态回复会踩空——教程第六章）
@@ -2529,6 +2530,17 @@ return restPut("msg:", id, body, ["content","from","to","locked"]);
 if (path === "/api/message" && method === "POST") {
 const body = await request.json();
 return jsonResponse(await executeTool("message_leave", body, env));
+}
+
+// ─── 聊天图片上传：发消息前先传图拿 id，消息体只存 id 引用（会话 KV 不装 base64）───
+// 出图走 routeRequest 前置的 /api/chat-image/:id（?key= 双鉴权，与动态图同一段代码）
+if (path === "/api/chat-image" && method === "POST") {
+const body = await request.json();
+let ids = null;
+try { ids = await storeImagesKV(env, body.images, "chatimg"); }
+catch (e) { return jsonResponse({ error: String(e?.message || e) }, 400); }
+if (!ids) return jsonResponse({ error: "images 不能为空" }, 400);
+return jsonResponse({ success: true, ids });
 }
 
 // ─── 动态流（二期 2-1）：留言板「动态」───
@@ -9619,10 +9631,11 @@ if (path === "/api/health" || path.startsWith("/api/health/")) {
 if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
 return handleHealth(request, env);
 }
-// ── 动态图片：<img src> 带不了请求头，双鉴权（?key=）同 health；immutable 强缓存，重复刷不重读 KV ──
-if (path.startsWith("/api/feed-image/")) {
+// ── 动态/聊天图片：<img src> 带不了请求头，双鉴权（?key=）同 health；immutable 强缓存，重复刷不重读 KV ──
+const imgServeMatch = path.match(/^\/api\/(feed|chat)-image\/([^\/]+)$/);
+if (imgServeMatch) {
 if (!checkMcpAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
-const rec = await kvGet(env, `feedimg:${path.slice("/api/feed-image/".length)}`);
+const rec = await kvGet(env, `${imgServeMatch[1] === "chat" ? "chatimg" : "feedimg"}:${imgServeMatch[2]}`);
 if (!rec?.data) return jsonResponse({ error: "Not found" }, 404);
 try {
 const bin = atob(rec.data);
