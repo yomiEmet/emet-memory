@@ -10003,10 +10003,16 @@ tools: body.tools,
 messages: body.messages,
 savedAt: body.savedAt || now(),
 }; // 红线：不接收/不存 apiKey
-await kvPut(env, "keepalive:snapshot", snap);
-// 新快照 = 新起点：清熔断计数（展开保留 maxTokensOne 降级记忆 + lastBeat/logs 记账）
+// 去重：重发/重试场景内容未变（savedAt 除外）→ 跳过写。正常连聊 messages 必增长，不受影响。
+const prevSnap = await kvGet(env, "keepalive:snapshot");
+const sig = (s) => JSON.stringify([s?.providerId, s?.model, s?.system, s?.tools, s?.messages]);
+if (!prevSnap || sig(prevSnap) !== sig(snap)) await kvPut(env, "keepalive:snapshot", snap);
+// 新快照 = 新起点：清熔断计数（展开保留 maxTokensOne 降级记忆 + lastBeat/logs 记账）；
+// 计数全零时写与不写等价 → 跳过，正常连聊每轮省 1 笔
 const prev = (await kvGet(env, "keepalive:state")) || {};
+if (prev.consecErrors || prev.consecBadCache || prev.pausedReason) {
 await kvPut(env, "keepalive:state", { ...prev, consecErrors: 0, consecBadCache: 0, pausedReason: null });
+}
 return jsonResponse({ success: true, savedAt: snap.savedAt });
 }
 if (path === "/api/keepalive/status" && request.method === "GET") {
