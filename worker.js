@@ -7749,10 +7749,9 @@ async function mem2SearchL1(env, query, n = 5, logAccess = true, preload = null)
         logStmts.push(env.DB.prepare(
           "UPDATE l1_memories SET access_count = access_count + 1, last_accessed = datetime('now') WHERE id = ?"
         ).bind(x.id));
-      } else if (x.kind === "mem") {
-        const m = memById.get(x.id);
-        if (m) { m.activations = (m.activations || 0) + 1; await kvPut(env, "mem:" + x.id, m); }
       }
+      // mem 类不再逐条整写 KV 回填 activations——每命中 1 条=重写整条记忆，聊天日几百笔写，
+      // 是 2026-07-26 写爆表的元凶之一。recall_log 已有完整流水，syncActivations 每日 22:30 水位线聚合回填。
     }
     try { await env.DB.batch(logStmts); } catch (e) {}
   }
@@ -7760,6 +7759,34 @@ async function mem2SearchL1(env, query, n = 5, logAccess = true, preload = null)
     id: x.id, date: x.date, category: x.category, document: x.document,
     quote: x.quote, conv_id: x.conv_id, distance: x.dist, score: Math.round(x.score * 1000) / 1000,
   }));
+}
+
+// ─── activations 日结：recall_log(D1) 按 id 水位线增量聚合 → mem: 批量写回 ───
+// 替代"每命中一条就整写一条"。写入量从聊天日几百笔降到每天 (被想起的不同记忆数+1) 笔。
+// 首跑只立水位线不聚合：历史流水在旧实时写回年代已经 +1 过，再算一遍就双重计数。
+async function syncActivations(env) {
+  const wm = await kvGet(env, "meta:activation-sync");
+  if (!wm) {
+    const head = await env.DB.prepare("SELECT MAX(id) AS mx FROM recall_log").first();
+    await kvPut(env, "meta:activation-sync", { lastId: head?.mx || 0, at: now(), init: true });
+    return { init: true, lastId: head?.mx || 0 };
+  }
+  const q = await env.DB.prepare(
+    "SELECT memory_id, COUNT(*) AS c, MAX(id) AS mx FROM recall_log WHERE id > ? GROUP BY memory_id"
+  ).bind(wm.lastId || 0).all();
+  const rows = q?.results || [];
+  if (!rows.length) return { synced: 0 };
+  let maxId = wm.lastId || 0, synced = 0;
+  for (const r of rows) {
+    if (r.mx > maxId) maxId = r.mx;
+    const m = await kvGet(env, "mem:" + r.memory_id);
+    if (!m) continue; // extract 层的 id 不在 mem: 下，天然跳过
+    m.activations = (m.activations || 0) + r.c;
+    await kvPut(env, "mem:" + r.memory_id, m);
+    synced++;
+  }
+  await kvPut(env, "meta:activation-sync", { lastId: maxId, at: now() });
+  return { synced, maxId };
 }
 
 // 目录注入（paramecium /inject 的 memory_index 部分）：一行一条只有标题，全文靠 recall 按需拉。
@@ -8228,6 +8255,7 @@ ctx.waitUntil((async () => {
 const cn = cnNow();
 if (cn.getUTCHours() === 14 && cn.getUTCMinutes() >= 30) {
   ctx.waitUntil(generateDaily(env).catch(() => {}));
+  ctx.waitUntil(syncActivations(env).catch(() => {})); // activations 日结（替代 recall 实时整写回填）
 }
 return;
 }
