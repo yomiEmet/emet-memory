@@ -7956,31 +7956,58 @@ const momVecPoint = (m, vec) => ({
   },
 });
 
+// 标记表用「键名编码」：momvec:<id>:<hash>，值恒为 "1"。
+// 列键名只花 1 个子请求/千键，绝不逐条取值——否则标记数逼近瞬记数后，
+// 每轮 sweep 的基础开销就把 1000 子请求额度吃穿（1101，2026-07-26 实测踩中）。
+async function kvListKeyNames(env, prefix) {
+  const names = [];
+  let cursor = null;
+  do {
+    const l = await env.MEMORY.list({ prefix, cursor });
+    names.push(...l.keys.map((k) => k.name));
+    cursor = l.list_complete ? null : l.cursor;
+  } while (cursor);
+  return names;
+}
+const momMarkKey = (id, h) => "momvec:" + id + ":" + h;
+
 async function momentVecUpsert(env, m) {
   const vec = await embedText(env, momVecText(m));
   if (!vec) return false;
   await env.VEC.upsert([momVecPoint(m, vec)]);
-  await kvPut(env, "momvec:" + m.id, { id: m.id, h: momHash(momVecText(m)) });
+  await env.MEMORY.put(momMarkKey(m.id, momHash(momVecText(m))), "1");
   return true;
 }
 
 async function momentVecSweep(env, cap = 80) {
   const moms = await kvListByPrefix(env, "mom:");
-  const marks = await kvListByPrefix(env, "momvec:");
-  const markById = new Map(marks.map((x) => [x.id, x.h]));
   const momById = new Map(moms.map((m) => [m.id, m]));
-  let purged = 0;
-  // 幽灵清理：标记还在、瞬记已删 → 删向量 + 标记
-  for (const [id] of markById) {
-    if (momById.has(id)) continue;
-    try { await env.VEC.deleteByIds(["mom:" + id]); } catch (e) {}
-    await kvDelete(env, "momvec:" + id);
-    if (++purged >= cap) break;
+  // 解析标记键名：momvec:<id>:<hash>（旧格式 momvec:<id> 无 hash 段 → 视作过期，自动迁移）
+  const markNames = await kvListKeyNames(env, "momvec:");
+  const markById = new Map(); // id → { h, key }
+  const stray = [];           // 旧格式/重复键，一律清
+  for (const name of markNames) {
+    const rest = name.slice(7);
+    const sep = rest.lastIndexOf(":");
+    if (sep <= 0) { stray.push(name); continue; }
+    const id = rest.slice(0, sep), h = rest.slice(sep + 1);
+    if (markById.has(id)) stray.push(momMarkKey(id, markById.get(id).h));
+    markById.set(id, { h, key: name });
   }
-  // 缺的 / 内容变了 → 批量嵌入 + 覆盖
+  let purged = 0, cleaned = 0;
+  for (const name of stray) { if (cleaned >= cap) break; await kvDelete(env, name); cleaned++; }
+  // 幽灵清理：标记还在、瞬记已删 → 删向量 + 标记
+  for (const [id, mk] of markById) {
+    if (momById.has(id)) continue;
+    if (purged >= cap) break;
+    try { await env.VEC.deleteByIds(["mom:" + id]); } catch (e) {}
+    await kvDelete(env, mk.key);
+    purged++;
+  }
+  // 缺的 / 内容变了 → 批量嵌入 + 覆盖标记
   const todo = [];
   for (const m of moms) {
-    if (markById.get(m.id) !== momHash(momVecText(m))) todo.push(m);
+    if (markById.get(m.id)?.h !== momHash(momVecText(m))) todo.push(m);
     if (todo.length >= cap) break;
   }
   let upserted = 0;
@@ -7989,10 +8016,14 @@ async function momentVecSweep(env, cap = 80) {
     const vecs = await mem2EmbedBatch(env, batch.map(momVecText));
     const pts = batch.map((m, j) => momVecPoint(m, vecs[j])).filter((p) => Array.isArray(p.values));
     if (pts.length) await env.VEC.upsert(pts);
-    for (const m of batch) await kvPut(env, "momvec:" + m.id, { id: m.id, h: momHash(momVecText(m)) });
+    for (const m of batch) {
+      const old = markById.get(m.id);
+      if (old) await kvDelete(env, old.key);
+      await env.MEMORY.put(momMarkKey(m.id, momHash(momVecText(m))), "1");
+    }
     upserted += pts.length;
   }
-  return { total: moms.length, upserted, purged, pending: Math.max(0, moms.length - marks.length - upserted) };
+  return { total: moms.length, upserted, purged, migrated: cleaned, pending: Math.max(0, todo.length === cap ? 1 : 0) };
 }
 
 async function momentVecSearch(env, query, n = 10) {
