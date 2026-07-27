@@ -9854,7 +9854,8 @@ return jsonResponse({ error: "Not found" }, 404);
 // 缓存保活（keepalive）：重放前端上传的"请求快照"，免费续期 Anthropic prompt cache
 // 与"心跳系统"(heartbeat=主动消息)完全独立：不写会话、不发推送、零副作用。
 // KV：config:keepalive → {enabled}；keepalive:snapshot → 前端每轮聊天成功后覆盖；
-//     keepalive:lastBeat → ISO；keepalive:state → 熔断状态；keepalive:log:<ts> → 单拍结果(7天过期)
+//     keepalive:state → 熔断状态 + lastBeat + logs[48]（单键；旧 lastBeat/log:<ts> 键已弃用——
+//     每拍 3 写并成 1 写，KV 免费档写额度 1000/天，2026-07-26 爆表后的减写改造）
 // 安全边界：快照不含 apiKey（重放时按 providerId 从 settings:global 现查）；日志只记 usage 数字。
 // ════════════════════════════════════════════════════════════
 
@@ -9889,8 +9890,8 @@ const p = (settings?.providers || []).find((x) => x.id === snap.providerId);
 if (!p || !p.enabled || !p.apiKey || (p.protocol || "anthropic") !== "anthropic") return { skipped: "provider-gone" };
 if (settings?.chatTarget?.providerId !== snap.providerId || settings?.chatTarget?.model !== snap.model) return { skipped: "target-switched" };
 
-// 节拍闸门：距上次聊天/上拍 ≥ 25 分钟
-const lastBeatIso = await env.MEMORY.get("keepalive:lastBeat");
+// 节拍闸门：距上次聊天/上拍 ≥ 25 分钟（lastBeat 已并入 state；旧独立键仅作升级过渡兜底）
+const lastBeatIso = state.lastBeat || (await env.MEMORY.get("keepalive:lastBeat"));
 const lastActive = Math.max(new Date(snap.savedAt).getTime(), lastBeatIso ? new Date(lastBeatIso).getTime() : 0);
 if (Date.now() - lastActive < KEEPALIVE_MIN_GAP_MIN * 60 * 1000) return { skipped: "recent" };
 
@@ -9942,16 +9943,17 @@ const write = usage?.cache_creation_input_tokens || 0;
 if (write > 1000 || (read === 0 && write === 0)) state.consecBadCache = (state.consecBadCache || 0) + 1;
 else state.consecBadCache = 0;
 if (state.consecBadCache >= 2) state.pausedReason = "连续未命中缓存（在重写或缓存标记被剥离），已暂停（下次聊天自动恢复）";
-await env.MEMORY.put("keepalive:lastBeat", ts);
+state.lastBeat = ts;
 }
-await kvPut(env, "keepalive:state", state);
-await env.MEMORY.put(`keepalive:log:${ts}`, JSON.stringify({
+// 单键记账：日志环形保留 48 条（一整天），lastBeat/logs 全在 state 里 → 每拍 1 写
+state.logs = [{
 ts, ok: !err, ms: Date.now() - t0, err: err || undefined,
 read: usage?.cache_read_input_tokens ?? null,
 write: usage?.cache_creation_input_tokens ?? null,
 input: usage?.input_tokens ?? null,
 output: usage?.output_tokens ?? null,
-}), { expirationTtl: 7 * 24 * 3600 });
+}, ...(Array.isArray(state.logs) ? state.logs : [])].slice(0, 48);
+await kvPut(env, "keepalive:state", state);
 return { ok: !err, err: err || undefined, usage };
 }
 
@@ -9974,23 +9976,17 @@ messages: body.messages,
 savedAt: body.savedAt || now(),
 }; // 红线：不接收/不存 apiKey
 await kvPut(env, "keepalive:snapshot", snap);
-// 新快照 = 新起点：清熔断计数（保留 maxTokensOne 的降级记忆）
+// 新快照 = 新起点：清熔断计数（展开保留 maxTokensOne 降级记忆 + lastBeat/logs 记账）
 const prev = (await kvGet(env, "keepalive:state")) || {};
-await kvPut(env, "keepalive:state", { consecErrors: 0, consecBadCache: 0, pausedReason: null, maxTokensOne: !!prev.maxTokensOne });
+await kvPut(env, "keepalive:state", { ...prev, consecErrors: 0, consecBadCache: 0, pausedReason: null });
 return jsonResponse({ success: true, savedAt: snap.savedAt });
 }
 if (path === "/api/keepalive/status" && request.method === "GET") {
 const cfg = (await kvGet(env, "config:keepalive")) || defaultKeepaliveConfig();
 const state = (await kvGet(env, "keepalive:state")) || null;
 const snap = await kvGet(env, "keepalive:snapshot");
-const lastBeat = await env.MEMORY.get("keepalive:lastBeat");
-const list = await env.MEMORY.list({ prefix: "keepalive:log:" });
-const keys = list.keys.sort((a, b) => b.name.localeCompare(a.name)).slice(0, 30);
-const logs = [];
-for (const k of keys) {
-const raw = await env.MEMORY.get(k.name);
-if (raw) logs.push(JSON.parse(raw));
-}
+const lastBeat = state?.lastBeat || (await env.MEMORY.get("keepalive:lastBeat")); // 旧键兜底（升级过渡）
+const logs = Array.isArray(state?.logs) ? state.logs : []; // 已并入 state，免掉 1 list + 30 读
 const cnDay = cnNow().toISOString().slice(0, 10);
 const today = logs.filter((l) => new Date(new Date(l.ts).getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10) === cnDay);
 const sum = (arr, f) => arr.reduce((a, x) => a + (x[f] || 0), 0);
