@@ -2978,7 +2978,10 @@ if (path === "/api/chat/sync" && method === "POST") {
   for (const s of incoming) {
     if (!s || !s.id) continue;
     const existing = await kvGet(env, "chat:" + s.id);
-    await kvPut(env, "chat:" + s.id, mergeSession(existing, s));
+    const merged = mergeSession(existing, s);
+    // 无变化不写：全量对账时绝大多数会话没动过，原来 47 会话=47 写，现在只写真变的
+    if (existing && JSON.stringify(merged) === JSON.stringify(existing)) continue;
+    await kvPut(env, "chat:" + s.id, merged);
     await mem2MarkDirty(env, s.id); // L0 装订工增量信号
   }
   const all = await kvListByPrefix(env, "chat:");
@@ -2990,8 +2993,11 @@ if (chatMatch && method === "PUT") {
   const body = await request.json();
   const existing = await kvGet(env, "chat:" + id);
   const merged = mergeSession(existing, { ...body, id });
-  await kvPut(env, "chat:" + id, merged);
-  await mem2MarkDirty(env, id); // L0 装订工增量信号
+  // 无变化不写（重复防抖推送/pull 后回写场景），装订脏标记一并省
+  if (!existing || JSON.stringify(merged) !== JSON.stringify(existing)) {
+    await kvPut(env, "chat:" + id, merged);
+    await mem2MarkDirty(env, id); // L0 装订工增量信号
+  }
   return jsonResponse({ success: true, item: merged });
 }
 if (chatMatch && method === "DELETE") {
